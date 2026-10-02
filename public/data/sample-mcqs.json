@@ -1,0 +1,38 @@
+[
+  {
+    "q": "Which organelle is responsible for ATP synthesis?",
+    "o": ["Nucleus", "Mitochondria", "Lysosome", "Vacuole"],
+    "a": 1,
+    "topic": "Cell Biology",
+    "course": "MDCAT",
+    "src": "MDCAT 2023",
+    "exp": "Mitochondria produce ATP through oxidative phosphorylation."
+  },
+  {
+    "q": "What is the SI unit of electrical resistance?",
+    "o": ["Ohm", "Volt", "Ampere", "Watt"],
+    "a": 0,
+    "topic": "Physics",
+    "course": "ECAT",
+    "src": "ECAT 2022",
+    "exp": "Resistance is measured in Ohms (Ω) according to Ohm's law."
+  },
+  {
+    "q": "The pH of a neutral solution at 25°C is:",
+    "o": ["0", "7", "14", "1"],
+    "a": 1,
+    "topic": "Chemistry",
+    "course": "MDCAT",
+    "src": "MDCAT 2021",
+    "exp": "At 25°C, [H+] = [OH-] = 10^-7 M, which yields pH = 7."
+  },
+  {
+    "q": "The derivative of sin(x) with respect to x is:",
+    "o": ["cos(x)", "-cos(x)", "tan(x)", "sec(x)"],
+    "a": 0,
+    "topic": "Calculus",
+    "course": "FSc",
+    "src": "",
+    "exp": "The standard trigonometric derivative of sin(x) is cos(x)."
+  }
+]
