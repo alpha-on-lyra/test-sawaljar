@@ -1,6 +1,15 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import type { MonthlyTest } from '@/lib/monthly';
+import { useUser } from '@/lib/useUser';
+import { useTheme } from '@/lib/useTheme';
+import { StripBar, DEFAULT_STRIP } from '@/components/TopStrip';
+import { useCloudSync } from '@/lib/useCloud';
+import { getSupabase, isSupabaseConfigured } from '@/lib/supabase';
+import { syncFromCloud, pushAll, cloudDbUsage, cloudCleanup } from '@/lib/cloud';
+import type { Strip } from '@/components/TopStrip';
+
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import Link from 'next/link';
 import { AdminNav, AdminViewKey } from '@/components/AdminNav';
 import {
@@ -13,6 +22,9 @@ import {
 } from '@/lib/store';
 import {
   AppState,
+  Course,
+  Topic,
+  TopicResource,
   User,
   MCQ,
   RattaCard,
@@ -20,10 +32,111 @@ import {
   JsonSourceItem,
 } from '@/lib/types';
 
-export default function AdminPage() {
+type BankOpts = { shuffleQ: boolean; shuffleO: boolean; showExp: boolean; retake: boolean; negMark: boolean; perSession: number; secPerQ: number };
+type RattaOpts = { shuffle: boolean; selfCheck: boolean; perSession: number };
+type Res = { title: string; url: string };
+type BankSet = { id: string; name: string; kind: 'upload' | 'link'; url?: string; course: string; subject?: string; topic: string; ids: string[]; yt: Res[]; pdf: Res[]; updated: number };
+type Extras = { mcq: BankOpts; ratta: RattaOpts; mcqSets: BankSet[]; rattaSets: BankSet[]; stats?: Record<string, { views: number; attempts: number }>; monthly?: MonthlyTest[]; offline?: Record<string, boolean>; adSlots?: Record<string, AdSlot>; strip?: Strip };
+type AdSlot = { on: boolean; provider: 'adsense' | 'adsterra'; code: string; height: number };
+type BankKind = 'mcq' | 'ratta';
+type BankForm = { course: string; subject: string; newSubject: string; topic: string; newTopic: string; mode: 'upload' | 'link'; url: string; name: string; text: string; file: string };
+type Parsed = { items: Record<string, unknown>[]; yt: Res[]; pdf: Res[]; name?: string; skipped: number };
+const NEW_TOPIC = '__new';
+const EMPTY_FORM: BankForm = { course: '', subject: '', newSubject: '', topic: '', newTopic: '', mode: 'upload', url: '', name: '', text: '', file: '' };
+const toRes = (v: unknown, label: string): Res[] => {
+  const arr = Array.isArray(v) ? v : v ? [v] : [];
+  return arr
+    .map((x, i) => {
+      if (typeof x === 'string') return { title: `${label} ${i + 1}`, url: x.trim() };
+      const o = (x || {}) as { title?: string; url?: string };
+      return { title: (o.title || `${label} ${i + 1}`).trim(), url: (o.url || '').trim() };
+    })
+    .filter((r) => /^https?:\/\//.test(r.url));
+};
+const parseBank = (text: string, kind: BankKind): Parsed | string => {
+  let d: unknown;
+  try {
+    d = JSON.parse(text);
+  } catch {
+    return 'Invalid JSON. Check commas and quotes.';
+  }
+  const root = (Array.isArray(d) ? {} : d || {}) as Record<string, unknown>;
+  const list = Array.isArray(d) ? d : root.mcqs ?? root.cards ?? root.items ?? root.questions;
+  if (!Array.isArray(list)) return 'JSON must be an array, or an object with an "mcqs" or "cards" array.';
+  let skipped = 0;
+  const items: Record<string, unknown>[] = [];
+  list.forEach((x) => {
+    const o = (x || {}) as Record<string, unknown>;
+    const a = o.a as number;
+    const ok =
+      typeof o.q === 'string' && o.q.trim() &&
+      (kind === 'mcq'
+        ? Array.isArray(o.o) && o.o.length >= 2 && Number.isInteger(a) && a >= 0 && a < o.o.length
+        : typeof o.a === 'string' && o.a.trim());
+    if (ok) items.push(o);
+    else skipped++;
+  });
+  if (!items.length) return `No valid ${kind === 'mcq' ? 'MCQs' : 'cards'} found (${skipped} skipped).`;
+  return { items, skipped, yt: toRes(root.youtube, 'Video'), pdf: toRes(root.pdf, 'PDF'), name: typeof root.title === 'string' ? root.title : undefined };
+};
+type GaRow = { dims: string[]; metrics: number[] };
+const DEFAULT_EXTRAS: Extras = {
+  mcq: { shuffleQ: true, shuffleO: true, showExp: true, retake: true, negMark: false, perSession: 20, secPerQ: 60 },
+  ratta: { shuffle: true, selfCheck: true, perSession: 20 },
+  mcqSets: [],
+  rattaSets: [],
+};
+// Reads the Supabase session token that supabase-js keeps in localStorage
+const getSbToken = (): string => {
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i) || '';
+      if (/^sb-.*-auth-token$/.test(k)) {
+        const v = JSON.parse(localStorage.getItem(k) || '{}');
+        if (v.access_token) return v.access_token as string;
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return '';
+};
+
+function FilePick({ name, onFile }: { name?: string; onFile: (f: File) => void }) {
+  const ref = useRef<HTMLInputElement>(null);
+  return (
+    <div className="flex items-center gap-2 min-w-0">
+      <button type="button" className="b" onClick={() => ref.current?.click()}>Choose JSON file</button>
+      <span className="text-xs text-[var(--mut)] truncate">{name || 'No file chosen'}</span>
+      <input
+        ref={ref}
+        type="file"
+        accept=".json,application/json"
+        className="sr-only"
+        tabIndex={-1}
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) onFile(f);
+          e.target.value = '';
+        }}
+      />
+    </div>
+  );
+}
+
+function AdminApp() {
   const [state, setState] = useState<AppState>(seedInitialData());
+  const cloud = useCloudSync();
+  const [usage, setUsage] = useState<{ bytes: number; limit: number } | null>(null);
+  useEffect(() => {
+    const f = () => setState(loadAppState());
+    window.addEventListener('sj_cloud_pulled', f);
+    return () => window.removeEventListener('sj_cloud_pulled', f);
+  }, []);
+  useEffect(() => {
+    if (cloud.role === 'admin' && cloud.mode === 'ok') void cloudDbUsage().then(setUsage).catch(() => undefined);
+  }, [cloud.role, cloud.mode, cloud.at]);
   const [view, setView] = useState<AdminViewKey>('dash');
-  const [online, setOnline] = useState(7);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const toastTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [modalContent, setModalContent] = useState<React.ReactNode | null>(null);
@@ -34,20 +147,27 @@ export default function AdminPage() {
 
   // MCQ view state
   const [mcqQuery, setMcqQuery] = useState('');
-  const [mcqJsonInput, setMcqJsonInput] = useState('');
-  const [jsonLinkUrl, setJsonLinkUrl] = useState('');
-  const [jsonLinkKind, setJsonLinkKind] = useState('Same hosting');
 
-  // Course state
+  // Course & Topic state
+  const [selectedAdminCourse, setSelectedAdminCourse] = useState<string>('MDCAT');
   const [newCourseName, setNewCourseName] = useState('');
+  const [newCourseBadge, setNewCourseBadge] = useState('Medical');
+  const [newCourseDesc, setNewCourseDesc] = useState('');
+  const [newCourseIcon, setNewCourseIcon] = useState('📚');
+
+  // Topic states
+  const [newTopicName, setNewTopicName] = useState('');
+  const [newTopicDesc, setNewTopicDesc] = useState('');
+
+  // Resource states
+  const [resourceModalTopic, setResourceModalTopic] = useState<Topic | null>(null);
+  const [newResType, setNewResType] = useState<'youtube' | 'pdf'>('youtube');
+  const [newResTitle, setNewResTitle] = useState('');
+  const [newResUrl, setNewResUrl] = useState('');
+
+  // Single MCQ Creator state
 
   // Ratta state
-  const [rattaQ, setRattaQ] = useState('');
-  const [rattaA, setRattaA] = useState('');
-  const [rattaTopic, setRattaTopic] = useState('');
-  const [rattaCourse, setRattaCourse] = useState('MDCAT');
-  const [rattaSrc, setRattaSrc] = useState('');
-  const [rattaJsonInput, setRattaJsonInput] = useState('');
 
   // Announcements state
   const [annTitle, setAnnTitle] = useState('');
@@ -57,12 +177,6 @@ export default function AdminPage() {
   // Security state
   const [newIp, setNewIp] = useState('');
 
-  // Dynamic live feed
-  const [feed, setFeed] = useState<[string, string][]>([
-    ['Ayesha Khan', 'solved an MCQ'],
-    ['Hira Malik', 'started a revision set'],
-    ['Bilal Ahmed', 'logged in with Google'],
-  ]);
 
   // Load from local storage on mount
   useEffect(() => {
@@ -75,26 +189,6 @@ export default function AdminPage() {
       document.documentElement.dataset.theme = savedTheme;
     }
 
-    // Live activity ticker
-    const interval = setInterval(() => {
-      setOnline((prev) => Math.max(1, prev + Math.floor(Math.random() * 3) - 1));
-      const actions = [
-        'solved an MCQ',
-        'finished a revision set',
-        'shared a score',
-        'bookmarked a question',
-        'logged in with Google',
-      ];
-      setFeed((prev) => {
-        const uList = loaded.users.filter((u) => u.status === 'active');
-        if (!uList.length) return prev;
-        const randomUser = uList[Math.floor(Math.random() * uList.length)];
-        const randomAction = actions[Math.floor(Math.random() * actions.length)];
-        return [[randomUser.name, randomAction], ...prev.slice(0, 11)];
-      });
-    }, 4500);
-
-    return () => clearInterval(interval);
   }, []);
 
   const showToast = (msg: string) => {
@@ -187,6 +281,493 @@ export default function AdminPage() {
   // VIEW RENDERERS
   // ==========================================
 
+  const [gaRange, setGaRange] = useState('28');
+  const [gaCourse, setGaCourse] = useState('');
+  const [gaRows, setGaRows] = useState<Record<string, GaRow[]>>({});
+  const [gaLoading, setGaLoading] = useState(false);
+  const [gaErr, setGaErr] = useState('');
+
+  const extrasRaw = (state as AppState & { extras?: Partial<Extras> }).extras;
+  const extras: Extras = {
+    mcq: { ...DEFAULT_EXTRAS.mcq, ...(extrasRaw?.mcq || {}) },
+    ratta: { ...DEFAULT_EXTRAS.ratta, ...(extrasRaw?.ratta || {}) },
+    mcqSets: extrasRaw?.mcqSets || [],
+    rattaSets: extrasRaw?.rattaSets || [],
+    stats: extrasRaw?.stats || {},
+    monthly: extrasRaw?.monthly || [],
+    offline: extrasRaw?.offline || {},
+    adSlots: extrasRaw?.adSlots || {},
+    strip: extrasRaw?.strip,
+  };
+  const saveExtras = (patch: Partial<Extras>, msg: string) =>
+    updateStateAndSave((prev) => ({ ...prev, extras: { ...((prev as AppState & { extras?: Partial<Extras> }).extras || {}), ...patch } } as AppState), msg);
+
+  const topicsFor = (course: string): string[] => {
+    const fromTopics = state.topics
+      .filter((t) => t.courseName === course)
+      .map((t) => {
+        const x = t as unknown as { name?: string; title?: string };
+        return x.name || x.title || '';
+      });
+    const all = [
+      ...fromTopics,
+      ...state.mcqs.filter((m) => m.course === course).map((m) => m.topic),
+      ...state.ratta.filter((c) => c.course === course).map((c) => c.topic),
+      ...extras.mcqSets.filter((x) => x.course === course).map((x) => x.topic),
+      ...extras.rattaSets.filter((x) => x.course === course).map((x) => x.topic),
+    ];
+    return Array.from(new Set(all)).filter(Boolean);
+  };
+
+  const tg = (label: string, desc: string, on: boolean, set: (v: boolean) => void) => (
+    <div className="tg" key={label}>
+      <div>
+        {label}
+        <small>{desc}</small>
+      </div>
+      <label className="sw">
+        <input type="checkbox" checked={on} onChange={(e) => set(e.target.checked)} />
+        <span />
+      </label>
+    </div>
+  );
+  const numBox = (label: string, v: number, min: number, max: number, set: (n: number) => void) => (
+    <div key={label}>
+      <small className="sub">{label}</small>
+      <input type="number" min={min} max={max} value={v} onChange={(e) => set(Math.min(max, Math.max(min, Number(e.target.value) || min)))} />
+    </div>
+  );
+
+  const renderMcqOptions = () => {
+    const o = extras.mcq;
+    const set = (p: Partial<BankOpts>) => saveExtras({ mcq: { ...o, ...p } }, 'Updated MCQ practice options');
+    return (
+      <div className="card">
+        <h3>Practice options for MCQs</h3>
+        {tg('Shuffle questions', 'New random order every session', o.shuffleQ, (v) => set({ shuffleQ: v }))}
+        {tg('Shuffle options', 'Randomise A, B, C, D for each question', o.shuffleO, (v) => set({ shuffleO: v }))}
+        {tg('Show explanation after answering', 'Uses the explanation saved with each MCQ', o.showExp, (v) => set({ showExp: v }))}
+        {tg('Allow retakes', 'Students can repeat a session', o.retake, (v) => set({ retake: v }))}
+        {tg('Negative marking', 'A wrong answer loses marks', o.negMark, (v) => set({ negMark: v }))}
+        <div className="row mt-3">
+          {numBox('Questions per session', o.perSession, 5, 200, (n) => set({ perSession: n }))}
+          {numBox('Seconds per question (0 = untimed)', o.secPerQ, 0, 600, (n) => set({ secPerQ: n }))}
+        </div>
+      </div>
+    );
+  };
+
+  const renderRattaOptions = () => {
+    const o = extras.ratta;
+    const set = (p: Partial<RattaOpts>) => saveExtras({ ratta: { ...o, ...p } }, 'Updated Ratta Card options');
+    return (
+      <div className="card">
+        <h3>Revision options for Ratta Cards</h3>
+        {tg('Shuffle cards', 'Random order every session', o.shuffle, (v) => set({ shuffle: v }))}
+        {tg('Self-check buttons', 'Show "I knew it / I did not" after the answer is revealed', o.selfCheck, (v) => set({ selfCheck: v }))}
+        <div className="row mt-3">{numBox('Cards per session', o.perSession, 5, 200, (n) => set({ perSession: n }))}</div>
+      </div>
+    );
+  };
+
+  const subjectsFor = (course: string): string[] => Array.from(new Set([...extras.mcqSets, ...extras.rattaSets].filter((x) => x.course === course && x.subject).map((x) => x.subject as string)));
+  const topicsIn = (course: string, subject: string): string[] =>
+    Array.from(new Set([...extras.mcqSets, ...extras.rattaSets].filter((x) => x.course === course && x.subject === subject).map((x) => x.topic))).filter(Boolean);
+  const [bm, setBm] = useState<Record<BankKind, BankForm>>({ mcq: { ...EMPTY_FORM }, ratta: { ...EMPTY_FORM } });
+  const [bq, setBq] = useState('');
+  const [bcf, setBcf] = useState('');
+  const patchBm = (k: BankKind, p: Partial<BankForm>) => setBm((s) => ({ ...s, [k]: { ...s[k], ...p } }));
+  const setsOf = (k: BankKind): BankSet[] => (k === 'mcq' ? extras.mcqSets : extras.rattaSets);
+  const courseOf = (k: BankKind) => (state.courses.some((c) => c.name === bm[k].course) ? bm[k].course : state.courses[0]?.name || '');
+  const fileLabel = (u?: string) => {
+    try {
+      return new URL(u || '', window.location.origin).pathname.split('/').pop() || 'link';
+    } catch {
+      return 'link';
+    }
+  };
+
+  const commitSet = (k: BankKind, p: Parsed, meta: { name: string; kind: 'upload' | 'link'; url?: string; course: string; subject?: string; topic: string }, replaceId?: string) => {
+    const setId = replaceId || uid('s');
+    const ids: string[] = [];
+    const mcqs: MCQ[] = [];
+    const cards: RattaCard[] = [];
+    p.items.forEach((o) => {
+      const course = String(o.course || meta.course);
+      const topic = String(o.topic || meta.topic);
+      if (k === 'mcq') {
+        const m: MCQ = { id: uid('q'), q: String(o.q).trim(), o: (o.o as unknown[]).map(String), a: o.a as number, topic, course, src: String(o.src || ''), exp: String(o.exp || '') };
+        ids.push(m.id);
+        mcqs.push(m);
+      } else {
+        const c: RattaCard = { id: uid('c'), q: String(o.q).trim(), a: String(o.a).trim(), topic, course, src: String(o.src || '') };
+        ids.push(c.id);
+        cards.push(c);
+      }
+    });
+    const key = k === 'mcq' ? 'mcqSets' : 'rattaSets';
+    updateStateAndSave((prev) => {
+      const ex = ((prev as AppState & { extras?: Partial<Extras> }).extras || {}) as Partial<Extras>;
+      const old = (ex[key] || []) as BankSet[];
+      const prevSet = old.find((s) => s.id === setId);
+      const drop = new Set(prevSet?.ids || []);
+      const set: BankSet = { id: setId, name: meta.name, kind: meta.kind, url: meta.url, course: meta.course, subject: meta.subject || 'General', topic: meta.topic, ids, yt: p.yt, pdf: p.pdf, updated: Date.now() };
+      const sets = prevSet ? old.map((s) => (s.id === setId ? set : s)) : [set, ...old];
+      const next = { ...prev, extras: { ...ex, [key]: sets } } as AppState;
+      return k === 'mcq' ? { ...next, mcqs: [...mcqs, ...prev.mcqs.filter((m) => !drop.has(m.id))] } : { ...next, ratta: [...cards, ...prev.ratta.filter((c) => !drop.has(c.id))] };
+    }, `${replaceId ? 'Updated' : 'Imported'} ${k === 'mcq' ? 'MCQ' : 'Ratta'} file "${meta.name}" (${ids.length} items)`);
+  };
+
+  const fetchBank = async (url: string): Promise<string | null> => {
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) return null;
+      return await r.text();
+    } catch {
+      return null;
+    }
+  };
+
+  const importNow = async (k: BankKind) => {
+    const f = bm[k];
+    const course = courseOf(k);
+    const subject = f.subject === NEW_TOPIC ? f.newSubject.trim() : f.subject || subjectsFor(course)[0] || '';
+    const topic = f.topic === NEW_TOPIC ? f.newTopic.trim() : f.topic || topicsIn(course, subject)[0] || '';
+    if (!course) return showToast('Add a course first');
+    if (!subject) return showToast('Choose a subject or create a new one');
+    if (!topic) return showToast('Choose a topic or create a new one');
+    let text = f.text;
+    let url: string | undefined;
+    if (f.mode === 'link') {
+      url = f.url.trim();
+      if (!/^https?:\/\/\S+$/.test(url)) return showToast('Paste a full https link to a JSON file');
+      const got = await fetchBank(url);
+      if (got === null) return showToast('Could not load that link. It must be public and allow cross-origin access');
+      text = got;
+    } else if (!text) return showToast('Choose a JSON file first');
+    const p = parseBank(text, k);
+    if (typeof p === 'string') return showToast(p);
+    commitSet(k, p, { name: f.name.trim() || p.name || (f.mode === 'link' ? fileLabel(url) : f.file.replace(/\.json$/i, '')) || 'Untitled', kind: f.mode, url, course, subject, topic });
+    patchBm(k, { text: '', file: '', url: '', name: '', newTopic: '', newSubject: '' });
+    showToast(`Imported ${p.items.length} items${p.skipped ? `, ${p.skipped} skipped` : ''}`);
+  };
+
+  const refreshSet = async (k: BankKind, s: BankSet) => {
+    const got = s.url ? await fetchBank(s.url) : null;
+    if (got === null) return showToast('Could not reload the link');
+    const p = parseBank(got, k);
+    if (typeof p === 'string') return showToast(p);
+    commitSet(k, p, { name: s.name, kind: 'link', url: s.url, course: s.course, subject: s.subject, topic: s.topic }, s.id);
+    showToast('Refreshed from link');
+  };
+
+  const deleteSet = (k: BankKind, s: BankSet) => {
+    if (!confirm(`Delete "${s.name}" and its ${s.ids.length} items?`)) return;
+    const drop = new Set(s.ids);
+    const key = k === 'mcq' ? 'mcqSets' : 'rattaSets';
+    updateStateAndSave((prev) => {
+      const ex = ((prev as AppState & { extras?: Partial<Extras> }).extras || {}) as Partial<Extras>;
+      const sets = ((ex[key] || []) as BankSet[]).filter((x) => x.id !== s.id);
+      const next = { ...prev, extras: { ...ex, [key]: sets } } as AppState;
+      return k === 'mcq' ? { ...next, mcqs: prev.mcqs.filter((m) => !drop.has(m.id)) } : { ...next, ratta: prev.ratta.filter((c) => !drop.has(c.id)) };
+    }, `Deleted ${k === 'mcq' ? 'MCQ' : 'Ratta'} file "${s.name}"`);
+    showToast('File deleted');
+  };
+
+  const saveEdit = (k: BankKind, s: BankSet) => {
+    const val = (id: string) => (document.getElementById(id) as HTMLInputElement | HTMLTextAreaElement | null)?.value || '';
+    const p = parseBank(val('es-json'), k);
+    if (typeof p === 'string') return showToast(p);
+    const topic = val('es-topic').trim();
+    if (!topic) return showToast('Topic cannot be empty');
+    commitSet(k, p, { name: p.name || s.name, kind: 'upload', course: val('es-course'), subject: val('es-subject').trim() || 'General', topic }, s.id);
+    setModalContent(null);
+    showToast('File updated');
+  };
+
+  const editSet = (k: BankKind, s: BankSet) => {
+    if (s.kind === 'link') return showToast('Editing is not supported for external links. Change the file at its source, then press Refresh.');
+    const items = (k === 'mcq' ? state.mcqs : state.ratta).filter((x) => s.ids.includes(x.id)).map((x) => {
+      const { id, course, topic, ...rest } = x as unknown as Record<string, unknown>;
+      void id;
+      void course;
+      return topic !== s.topic ? { ...rest, topic } : rest;
+    });
+    const body = JSON.stringify({ title: s.name, youtube: s.yt, pdf: s.pdf, [k === 'mcq' ? 'mcqs' : 'cards']: items }, null, 2);
+    setModalContent(
+      <div>
+        <h3 className="text-base font-bold mb-2">Edit &quot;{s.name}&quot;</h3>
+        <div className="row">
+          <select id="es-course" defaultValue={s.course}>
+            {state.courses.map((c) => (<option key={c.id} value={c.name}>{c.name}</option>))}
+          </select>
+          <input id="es-subject" type="text" list="es-subjects" defaultValue={s.subject || ''} placeholder="Subject" />
+          <datalist id="es-subjects">{subjectsFor(s.course).map((t) => (<option key={t} value={t} />))}</datalist>
+          <input id="es-topic" type="text" list="es-topics" defaultValue={s.topic} placeholder="Topic" />
+          <datalist id="es-topics">{topicsFor(s.course).map((t) => (<option key={t} value={t} />))}</datalist>
+        </div>
+        <p className="sub mb-1">Edit the JSON, or load a replacement file to update it.</p>
+        <FilePick
+          onFile={(file) => {
+            const r = new FileReader();
+            r.onload = () => {
+              (document.getElementById('es-json') as HTMLTextAreaElement).value = String(r.result || '');
+            };
+            r.readAsText(file);
+          }}
+        />
+        <textarea id="es-json" defaultValue={body} className="w-full h-64 mt-2" spellCheck={false} />
+        <div className="flex gap-2 mt-3">
+          <button type="button" className="b p" onClick={() => saveEdit(k, s)}>Save changes</button>
+          <button type="button" className="b" onClick={() => setModalContent(null)}>Cancel</button>
+        </div>
+      </div>
+    );
+  };
+
+  const renderBank = (k: BankKind) => {
+    const f = bm[k];
+    const course = courseOf(k);
+    const subjects = subjectsFor(course);
+    const subject = f.subject === NEW_TOPIC ? f.newSubject.trim() : f.subject || subjects[0] || '';
+    const topics = topicsIn(course, subject);
+    const sets = setsOf(k);
+    const q = bq.toLowerCase().trim();
+    const shown = sets.filter((s) => (!bcf || s.course === bcf) && (s.name + s.course + s.topic).toLowerCase().includes(q));
+    const st = (id: string) => extras.stats?.[id] || { views: 0, attempts: 0 };
+    const noun = k === 'mcq' ? 'MCQs' : 'Ratta Cards';
+    const sample = k === 'mcq'
+      ? '{\n  "title": "Cell Biology Set 1",\n  "youtube": ["https://www.youtube.com/watch?v=..."],\n  "pdf": ["https://example.com/notes.pdf"],\n  "mcqs": [\n    { "q": "Which organelle makes ATP?", "o": ["Nucleus","Mitochondria","Ribosome","Golgi"], "a": 1, "src": "MDCAT 2022", "exp": "Mitochondria produce ATP." }\n  ]\n}'
+      : '{\n  "title": "Cell Biology Cards",\n  "youtube": ["https://www.youtube.com/watch?v=..."],\n  "pdf": ["https://example.com/notes.pdf"],\n  "cards": [\n    { "q": "______ is the powerhouse of the cell.", "a": "Mitochondria", "src": "MDCAT 2022" }\n  ]\n}';
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+          <div className="stat"><span>JSON files</span><b>{sets.length}</b></div>
+          <div className="stat"><span>Total {noun}</span><b>{sets.reduce((n, x) => n + x.ids.length, 0)}</b></div>
+          <div className="stat"><span>Attempts</span><b>{sets.reduce((n, x) => n + st(x.id).attempts, 0)}</b></div>
+        </div>
+
+        <div className="card">
+          <h3>Import {noun} from JSON</h3>
+          <div className="row">
+            <div>
+              <small className="sub">Course</small>
+              <select value={course} onChange={(e) => patchBm(k, { course: e.target.value, subject: '', topic: '' })}>
+                {state.courses.map((c) => (<option key={c.id} value={c.name}>{c.name}</option>))}
+              </select>
+            </div>
+            <div>
+              <small className="sub">Subject</small>
+              <select value={f.subject || subjects[0] || NEW_TOPIC} onChange={(e) => patchBm(k, { subject: e.target.value, topic: '' })}>
+                {subjects.map((t) => (<option key={t} value={t}>{t}</option>))}
+                <option value={NEW_TOPIC}>+ Create new subject</option>
+              </select>
+            </div>
+            {(f.subject === NEW_TOPIC || !subjects.length) && (
+              <div>
+                <small className="sub">New subject name</small>
+                <input type="text" placeholder="e.g. Biology" value={f.newSubject} onChange={(e) => patchBm(k, { newSubject: e.target.value, subject: NEW_TOPIC })} />
+              </div>
+            )}
+            <div>
+              <small className="sub">Topic</small>
+              <select value={f.topic || topics[0] || NEW_TOPIC} onChange={(e) => patchBm(k, { topic: e.target.value })}>
+                {topics.map((t) => (<option key={t} value={t}>{t}</option>))}
+                <option value={NEW_TOPIC}>+ Create new topic</option>
+              </select>
+            </div>
+            {(f.topic === NEW_TOPIC || !topics.length) && (
+              <div>
+                <small className="sub">New topic name</small>
+                <input type="text" placeholder="e.g. Cell Biology" value={f.newTopic} onChange={(e) => patchBm(k, { newTopic: e.target.value, topic: NEW_TOPIC })} />
+              </div>
+            )}
+          </div>
+          <div className="flex gap-2 mb-3">
+            <button type="button" className={`b ${f.mode === 'upload' ? 'p' : ''}`} onClick={() => patchBm(k, { mode: 'upload' })}>Upload file</button>
+            <button type="button" className={`b ${f.mode === 'link' ? 'p' : ''}`} onClick={() => patchBm(k, { mode: 'link' })}>Paste link</button>
+          </div>
+          <div className="row">
+            {f.mode === 'upload' ? (
+              <FilePick
+                key="bank-file"
+                name={f.file}
+                onFile={(file) => {
+                  if (file.size > 2_000_000) return showToast('File is too large (2 MB max)');
+                  const r = new FileReader();
+                  r.onload = () => patchBm(k, { text: String(r.result || ''), file: file.name });
+                  r.readAsText(file);
+                }}
+              />
+            ) : (
+              <input key="bank-link" type="text" placeholder="https://example.com/file.json" value={f.url} onChange={(e) => patchBm(k, { url: e.target.value })} />
+            )}
+            <input type="text" placeholder="Name (optional)" value={f.name} onChange={(e) => patchBm(k, { name: e.target.value })} />
+            <button type="button" className="b p" onClick={() => void importNow(k)}>{f.mode === 'upload' ? 'Import file' : 'Add link'}</button>
+          </div>
+          <details>
+            <summary className="sub cursor-pointer">JSON format (explanations, YouTube and PDF suggestions)</summary>
+            <pre className="text-xs p-3 mt-2 rounded-lg overflow-auto bg-[var(--bg)]">{sample}</pre>
+          </details>
+        </div>
+
+        <div className="card">
+          <h3>{sets.length} JSON {sets.length === 1 ? 'file' : 'files'}</h3>
+          <div className="row">
+            <input type="search" placeholder="Search files" value={bq} onChange={(e) => setBq(e.target.value)} />
+            <select value={bcf} onChange={(e) => setBcf(e.target.value)} aria-label="Filter by course">
+              <option value="">All courses</option>
+              {state.courses.map((c) => (<option key={c.id} value={c.name}>{c.name}</option>))}
+            </select>
+          </div>
+          <div className="tw">
+            <table>
+              <thead>
+                <tr><th>File</th><th>Course / Topic</th><th>{noun}</th><th>Suggestions</th><th>Attempts</th><th>Updated</th><th /></tr>
+              </thead>
+              <tbody>
+                {shown.length ? shown.map((s) => (
+                  <tr key={s.id}>
+                    <td>
+                      <b>{s.name}</b>
+                      <small>{s.kind === 'link' ? 'External link' : 'Uploaded file'}</small>
+                    </td>
+                    <td>{s.course}<small>{s.subject || 'No subject: use Edit to set one'} › {s.topic}</small></td>
+                    <td>{s.ids.length}</td>
+                    <td className="text-xs">{s.yt.length} video, {s.pdf.length} PDF</td>
+                    <td>{st(s.id).attempts}<small>{st(s.id).views} views</small></td>
+                    <td className="text-xs text-[var(--mut)]">{timeAgo(s.updated)}</td>
+                    <td className="whitespace-nowrap">
+                      <button type="button" className="b" onClick={() => editSet(k, s)}>Edit</button>
+                      {s.kind === 'link' && (<button type="button" className="b" onClick={() => void refreshSet(k, s)}>Refresh</button>)}
+                      <button type="button" className="b d" onClick={() => deleteSet(k, s)}>Delete</button>
+                    </td>
+                  </tr>
+                )) : (<tr><td colSpan={7}>{sets.length ? 'No files match your search.' : 'No files yet. Import your first JSON file above.'}</td></tr>)}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        {k === 'mcq' ? renderMcqOptions() : renderRattaOptions()}
+      </div>
+    );
+  };
+
+  const loadGa = async () => {
+    setGaLoading(true);
+    setGaErr('');
+    try {
+      const out: Record<string, GaRow[]> = {};
+      for (const r of ['sources', 'pages', 'topics', 'countries']) {
+        const res = await fetch(`/api/ga?report=${r}&days=${gaRange}`, { headers: { Authorization: `Bearer ${getSbToken()}` } });
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({ error: '' }));
+          throw new Error(j.error || `Request failed (${res.status})`);
+        }
+        out[r] = ((await res.json()) as { rows?: GaRow[] }).rows || [];
+      }
+      setGaRows(out);
+    } catch (e) {
+      setGaErr(e instanceof Error ? e.message : 'Could not load analytics');
+    }
+    setGaLoading(false);
+  };
+
+  useEffect(() => {
+    if (view === 'ana') void loadGa();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, gaRange]);
+
+  const renderAnalytics = () => {
+    const tbl = (title: string, head: string[], rows: string[][]) => (
+      <div className="card">
+        <h3>{title}</h3>
+        <div className="tw">
+          <table>
+            <thead><tr>{head.map((h) => (<th key={h}>{h}</th>))}</tr></thead>
+            <tbody>
+              {rows.length ? rows.map((r, i) => (<tr key={i}>{r.map((c, j) => (<td key={j}>{c}</td>))}</tr>)) : (<tr><td colSpan={head.length}>No data yet.</td></tr>)}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+    const g = (k: string) => gaRows[k] || [];
+    const fmt = (rows: GaRow[]) => rows.map((r) => [...r.dims, ...r.metrics.map((n) => n.toLocaleString())]);
+    const topicRows = g('topics').filter((r) => !gaCourse || r.dims[0] === gaCourse);
+    const coverage = state.courses.flatMap((c) =>
+      topicsFor(c.name).map((t) => [c.name, t, String(state.mcqs.filter((m) => m.course === c.name && m.topic === t).length), String(state.ratta.filter((x) => x.course === c.name && x.topic === t).length)])
+    );
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="card">
+          <div className="row">
+            <select value={gaRange} onChange={(e) => setGaRange(e.target.value)}>
+              <option value="7">Last 7 days</option>
+              <option value="28">Last 28 days</option>
+              <option value="90">Last 90 days</option>
+            </select>
+            <select value={gaCourse} onChange={(e) => setGaCourse(e.target.value)}>
+              <option value="">All courses (topic views)</option>
+              {state.courses.map((c) => (<option key={c.id} value={c.name}>{c.name}</option>))}
+            </select>
+            <button type="button" className="b p" onClick={() => void loadGa()} disabled={gaLoading}>{gaLoading ? 'Loading...' : 'Refresh'}</button>
+          </div>
+          {gaErr && <p className="text-sm" style={{ color: 'var(--red)' }}>{gaErr}. Check the setup steps below.</p>}
+        </div>
+        {tbl('Where visitors come from', ['Source', 'Medium', 'Sessions', 'Users'], fmt(g('sources')))}
+        {tbl('Top pages', ['Page', 'Views', 'Users'], fmt(g('pages')))}
+        {tbl(gaCourse ? `Topic views in ${gaCourse}` : 'Topic views by course', ['Course', 'Topic', 'Views'], fmt(topicRows))}
+        {tbl('Countries', ['Country', 'Users', 'Sessions'], fmt(g('countries')))}
+        {tbl('Content in your bank', ['Course', 'Topic', 'MCQs', 'Ratta Cards'], coverage)}
+        <details className="card">
+          <summary className="font-bold cursor-pointer">Setup steps (Google Analytics 4 on Cloudflare Pages)</summary>
+          <ol className="sub list-decimal pl-5 mt-2 space-y-1">
+            <li>Create a GA4 property and copy its Measurement ID (G-XXXXXXX). Add it as NEXT_PUBLIC_GA_ID in your Cloudflare Pages build variables.</li>
+            <li>In GA4 Admin, Custom definitions, create two event-scoped dimensions named course and topic.</li>
+            <li>Create a Google Cloud service account, enable the Google Analytics Data API, and add its email as a Viewer on your GA4 property.</li>
+            <li>In Cloudflare Pages, add secrets GA_PROPERTY_ID, GA_CLIENT_EMAIL, GA_PRIVATE_KEY, SUPABASE_URL and SUPABASE_ANON_KEY.</li>
+            <li>In Supabase, mark your account as admin so only you can read these reports.</li>
+          </ol>
+        </details>
+      </div>
+    );
+  };
+
+  const renderCloud = () => {
+    const mb = (b: number) => (b / 1048576).toFixed(1);
+    const pct = usage ? Math.min(100, Math.round((usage.bytes / usage.limit) * 100)) : 0;
+    const text =
+      cloud.mode === 'off' ? 'Not connected. Add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY to .env.local, then restart the dev server.'
+      : cloud.mode === 'error' ? `Error: ${cloud.msg}`
+      : cloud.role === 'admin' ? 'Connected as admin. Every change you make is saved to Supabase.'
+      : cloud.role === 'user' ? 'You are signed in, but this account is not an admin, so changes are NOT saved to the cloud. Run the "make yourself admin" line from the SQL file.'
+      : 'You are not signed in, so changes are NOT saved to the cloud. Sign in with your admin Google account.';
+    const good = cloud.role === 'admin' && cloud.mode !== 'error';
+    return (
+      <div className="card mb-4">
+        <h3>Cloud sync <span className={`badge ${good ? '' : 'pending'}`}>{cloud.mode === 'syncing' ? 'Syncing...' : good ? 'Connected' : 'Check this'}</span></h3>
+        <p className="sub mb-3">{text}</p>
+        {usage && (
+          <div className="mb-3">
+            <div className="flex justify-between text-xs"><span>Database storage</span><b>{mb(usage.bytes)} MB of {mb(usage.limit)} MB</b></div>
+            <div className="h-2 rounded-full bg-[var(--line)] mt-1 overflow-hidden"><div className="h-full rounded-full" style={{ width: `${pct}%`, background: pct > 70 ? 'var(--bad, #b3261e)' : 'var(--pri)' }} /></div>
+          </div>
+        )}
+        <div className="flex gap-2 flex-wrap">
+          <button type="button" className="b p" onClick={() => void syncFromCloud(true)}>Sync now</button>
+          {cloud.role === 'admin' && (
+            <>
+              <button type="button" className="b" onClick={() => { if (confirm('Upload everything in this browser to Supabase? Use this once when the database is still empty.')) void pushAll().then(() => showToast('Uploaded to Supabase')); }}>Upload everything</button>
+              <button type="button" className="b" onClick={() => void cloudCleanup().then((m) => showToast(m)).catch((e: Error) => showToast(e.message))}>Clean old logs</button>
+            </>
+          )}
+          <button type="button" className="b" onClick={() => setView('ana')}>Open analytics</button>
+        </div>
+      </div>
+    );
+  };
+
   const renderDashboard = () => {
     const activeUsers = state.users.filter((u) => u.status === 'active');
     const pendingReports = state.reports.filter((r) => r.status === 'pending');
@@ -201,11 +782,8 @@ export default function AdminPage() {
             <b>{state.users.length}</b>
           </div>
           <div className="stat">
-            <span>
-              <i className="dot" />
-              Online Now
-            </span>
-            <b className="text-[var(--pri)]">{online}</b>
+            <span>Ratta Cards</span>
+            <b>{state.ratta.length}</b>
           </div>
           <div className="stat">
             <span>Active Accounts</span>
@@ -227,80 +805,24 @@ export default function AdminPage() {
           </div>
         </div>
 
-        <div className="two mb-4">
-          <div className="card">
-            <h3>MCQs Solved This Week</h3>
-            <div className="tw">
-              <svg viewBox="0 0 380 175" className="w-full min-w-[320px]">
-                {state.week.map((val, i) => {
-                  const h = (val / maxWeekVal) * 125;
-                  const x = i * 52 + 10;
-                  return (
-                    <g key={i}>
-                      <rect
-                        x={x}
-                        y={145 - h}
-                        width="34"
-                        height={h}
-                        rx="6"
-                        fill="var(--pri)"
-                        opacity="0.88"
-                      />
-                      <text
-                        x={x + 17}
-                        y="164"
-                        fontSize="11"
-                        textAnchor="middle"
-                        fill="var(--mut)"
-                      >
-                        {dayLabels[i]}
-                      </text>
-                      <text
-                        x={x + 17}
-                        y={138 - h}
-                        fontSize="11"
-                        fontWeight="700"
-                        textAnchor="middle"
-                        fill="var(--ink)"
-                      >
-                        {val}
-                      </text>
-                    </g>
-                  );
-                })}
-              </svg>
-            </div>
-          </div>
-
-          <div className="card">
-            <h3>
-              <i className="dot" />
-              Live User Activity
-            </h3>
-            <div className="feed flex flex-col gap-2">
-              {feed.slice(0, 6).map((item, i) => (
-                <div key={i} className="py-2 border-b border-[var(--line)] text-xs flex justify-between">
-                  <span>
-                    <b>{item[0]}</b> {item[1]}
-                  </span>
-                  <span className="text-[var(--mut)]">now</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
+        {renderCloud()}
 
         <div className="card">
           <h3>Enrolled Course Distribution</h3>
           <div className="flex flex-col gap-2">
             {state.courses.map((course) => {
-              const uCount = state.users.filter((u) => u.course === course).length;
-              const qCount = state.mcqs.filter((m) => m.course === course).length;
+              const uCount = state.users.filter((u) => u.course === course.name).length;
+              const qCount = state.mcqs.filter((m) => m.course === course.name).length;
+              const tCount = state.topics.filter((t) => t.courseName === course.name).length;
               return (
-                <div key={course} className="tg">
-                  <span className="font-bold">{course}</span>
+                <div key={course.id} className="tg">
+                  <div className="flex items-center gap-2">
+                    <span>{course.icon}</span>
+                    <span className="font-bold">{course.name}</span>
+                    <span className="badge text-[10px]">{course.badge}</span>
+                  </div>
                   <span className="text-xs text-[var(--mut)]">
-                    <b>{uCount}</b> users · <b>{qCount}</b> MCQs available
+                    <b>{uCount}</b> users · <b>{tCount}</b> topics · <b>{qCount}</b> MCQs
                   </span>
                 </div>
               );
@@ -579,9 +1101,18 @@ export default function AdminPage() {
             onClick={() => {
               const val = newCourseName.trim();
               if (!val) return showToast('Please enter a course name');
-              if (state.courses.includes(val)) return showToast('Course already exists');
+              if (state.courses.some((c) => c.name.toLowerCase() === val.toLowerCase())) return showToast('Course already exists');
+              const newCourse: Course = {
+                id: uid('c'),
+                name: val,
+                slug: val.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+                badge: 'General',
+                description: `${val} examination preparation track`,
+                icon: '📚',
+                color: '#2563eb',
+              };
               updateStateAndSave(
-                (prev) => ({ ...prev, courses: [...prev.courses, val] }),
+                (prev) => ({ ...prev, courses: [...prev.courses, newCourse] }),
                 `Added course ${val}`
               );
               setNewCourseName('');
@@ -594,34 +1125,37 @@ export default function AdminPage() {
 
         <div className="flex flex-col gap-2 mt-4">
           {state.courses.map((course) => {
-            const uCount = state.users.filter((u) => u.course === course).length;
-            const qCount = state.mcqs.filter((m) => m.course === course).length;
+            const uCount = state.users.filter((u) => u.course === course.name).length;
+            const qCount = state.mcqs.filter((m) => m.course === course.name).length;
             return (
-              <div key={course} className="tg">
+              <div key={course.id} className="tg">
                 <div>
-                  <b className="text-base">{course}</b>
+                  <b className="text-base flex items-center gap-1.5">{course.name}{extras.offline?.[course.id] && <span className="badge pending">Offline</span>}</b>
                   <small>
                     {uCount} users selected · {qCount} MCQs in bank
                   </small>
                 </div>
+                <div className="flex gap-2 flex-wrap">
+                <button type="button" className={`b ${extras.offline?.[course.id] ? 'p' : ''}`} onClick={() => setOffline(course.id, !extras.offline?.[course.id], course.name)}>{extras.offline?.[course.id] ? 'Offline: bring online' : 'Take offline'}</button>
                 <button
                   type="button"
                   className="b d"
                   onClick={() => {
-                    if (confirm(`Remove course ${course}?`)) {
+                    if (confirm(`Remove course ${course.name}?`)) {
                       updateStateAndSave(
                         (prev) => ({
                           ...prev,
-                          courses: prev.courses.filter((c) => c !== course),
+                          courses: prev.courses.filter((c) => c.id !== course.id),
                         }),
-                        `Removed course ${course}`
+                        `Removed course ${course.name}`
                       );
-                      showToast(`Removed ${course}`);
+                      showToast(`Removed ${course.name}`);
                     }
                   }}
                 >
                   Remove
                 </button>
+                </div>
               </div>
             );
           })}
@@ -630,479 +1164,87 @@ export default function AdminPage() {
     );
   };
 
-  const renderMcqs = () => {
-    const handleImportJson = () => {
-      try {
-        const parsed = JSON.parse(mcqJsonInput);
-        if (!Array.isArray(parsed)) return showToast('Input must be a JSON array of MCQs');
-        let imported = 0;
-        let skipped = 0;
-        const newItems: MCQ[] = [];
+  const exOf = (p: AppState): Partial<Extras> => ((p as AppState & { extras?: Partial<Extras> }).extras || {}) as Partial<Extras>;
+  const patchEx = (patch: Partial<Extras>, msg: string) => updateStateAndSave((prev) => ({ ...prev, extras: { ...exOf(prev), ...patch } } as AppState), msg);
+  const [mf, setMf] = useState<{ name: string; course: string; minutes: number; counts: Record<string, number> }>({ name: '', course: '', minutes: 0, counts: {} });
 
-        parsed.forEach((x: any) => {
-          if (
-            x &&
-            typeof x.q === 'string' &&
-            x.q.trim() &&
-            Array.isArray(x.o) &&
-            x.o.length >= 2 &&
-            Number.isInteger(x.a) &&
-            x.a >= 0 &&
-            x.a < x.o.length
-          ) {
-            newItems.push({
-              id: uid('q'),
-              q: x.q.trim(),
-              o: x.o.map(String),
-              a: x.a,
-              topic: x.topic || 'General',
-              course: x.course || 'General',
-              src: x.src || '',
-              exp: x.exp || '',
-            });
-            imported++;
-          } else {
-            skipped++;
-          }
-        });
+  const setOffline = (id: string, off: boolean, name: string) => {
+    patchEx({ offline: { ...(extras.offline || {}), [id]: off } }, `${off ? 'Took offline' : 'Brought online'} course ${name}`);
+    showToast(off ? `${name} is now offline` : `${name} is live`);
+  };
 
-        if (newItems.length > 0) {
-          updateStateAndSave(
-            (prev) => ({ ...prev, mcqs: [...newItems, ...prev.mcqs] }),
-            `Bulk imported ${imported} MCQs (${skipped} skipped)`
-          );
-          setMcqJsonInput('');
-          showToast(`Successfully imported ${imported} MCQs!`);
-        } else {
-          showToast(`Failed to import: ${skipped} invalid format`);
-        }
-      } catch {
-        showToast('Invalid JSON syntax');
-      }
-    };
+  const subjCounts = (course: string) => {
+    const m: Record<string, number> = {};
+    extras.mcqSets.filter((s) => s.course === course).forEach((s) => {
+      if (!s.subject) return;
+      m[s.subject] = (m[s.subject] || 0) + s.ids.length;
+    });
+    return m;
+  };
 
+  const createMonthly = (course: string, avail: Record<string, number>) => {
+    if (!mf.name.trim()) return showToast('Give the monthly test a name');
+    const parts = Object.keys(avail).map((s) => ({ subject: s, count: Math.floor(mf.counts[`${course}|${s}`] || 0) })).filter((p) => p.count > 0);
+    if (!parts.length) return showToast('Take questions from at least one subject');
+    const over = parts.find((p) => p.count > avail[p.subject]);
+    if (over) return showToast(`${over.subject} has only ${avail[over.subject]} MCQs`);
+    const t: MonthlyTest = { id: uid('m'), name: mf.name.trim(), course, parts, minutes: mf.minutes, live: true, created: Date.now() };
+    patchEx({ monthly: [t, ...(extras.monthly || [])] }, `Created monthly test ${t.name}`);
+    setMf({ name: '', course: '', minutes: 0, counts: {} });
+    showToast('Monthly test created');
+  };
+
+  const renderMonthly = () => {
+    const course = mf.course && state.courses.some((c) => c.name === mf.course) ? mf.course : state.courses[0]?.name || '';
+    const avail = subjCounts(course);
+    const subs = Object.keys(avail);
+    const list = extras.monthly || [];
     return (
       <div className="flex flex-col gap-4">
-        {/* Bulk Upload Card */}
         <div className="card">
-          <h3>Bulk JSON Upload</h3>
-          <div className="row mb-2">
-            <input
-              type="file"
-              accept=".json,application/json"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) {
-                  const reader = new FileReader();
-                  reader.onload = () => setMcqJsonInput(String(reader.result || ''));
-                  reader.readAsText(file);
-                }
-              }}
-            />
-            <button
-              type="button"
-              className="b"
-              onClick={() => {
-                setMcqJsonInput(
-                  JSON.stringify(
-                    [
-                      {
-                        q: 'Which organelle makes ATP?',
-                        o: ['Nucleus', 'Mitochondria', 'Lysosome', 'Vacuole'],
-                        a: 1,
-                        topic: 'Cell Biology',
-                        course: 'MDCAT',
-                        src: 'MDCAT 2023',
-                        exp: 'Mitochondria synthesize ATP through cellular respiration.',
-                      },
-                      {
-                        q: 'Unit of resistance?',
-                        o: ['Ohm', 'Volt', 'Amp', 'Watt'],
-                        a: 0,
-                        topic: 'Physics',
-                        course: 'ECAT',
-                        src: '',
-                        exp: 'Resistance = Voltage / Current (Ohm).',
-                      },
-                    ],
-                    null,
-                    2
-                  )
-                );
-              }}
-            >
-              Load Sample JSON
-            </button>
-          </div>
-
-          <textarea
-            placeholder="Paste a JSON array of MCQs here..."
-            value={mcqJsonInput}
-            onChange={(e) => setMcqJsonInput(e.target.value)}
-            className="w-full"
-          />
-          <div className="mt-2.5">
-            <button type="button" className="b p" onClick={handleImportJson}>
-              Import MCQs
-            </button>
-          </div>
-          <p className="sub mt-2">
-            Fields required: <code>q</code> (question), <code>o</code> (options array),{' '}
-            <code>a</code> (correct answer index starting at 0), <code>topic</code>,{' '}
-            <code>course</code>, <code>src</code> (past paper source or empty), <code>exp</code> (explanation).
-          </p>
-        </div>
-
-        {/* JSON Links Card */}
-        <div className="card">
-          <h3>JSON Links (Sync from Hosted URLs)</h3>
+          <h3>Create a monthly test</h3>
+          <p className="sub mb-3">Choose a course, then how many questions to take from each subject. Students get a fresh random set every time they start it.</p>
           <div className="row">
-            <input
-              type="text"
-              placeholder="/data/biology.json or https://example.com/mcqs.json"
-              value={jsonLinkUrl}
-              onChange={(e) => setJsonLinkUrl(e.target.value)}
-            />
-            <select
-              value={jsonLinkKind}
-              onChange={(e) => setJsonLinkKind(e.target.value)}
-              className="max-w-[180px]"
-            >
-              <option value="Same hosting">Same hosting</option>
-              <option value="External link">External link</option>
+            <input type="text" placeholder="e.g. October 2026 Monthly Test" value={mf.name} onChange={(e) => setMf({ ...mf, name: e.target.value })} />
+            <select value={course} onChange={(e) => setMf({ ...mf, course: e.target.value })} aria-label="Course">
+              {state.courses.map((c) => (<option key={c.id} value={c.name}>{c.name}</option>))}
             </select>
-            <button
-              type="button"
-              className="b p"
-              onClick={() => {
-                const u = jsonLinkUrl.trim();
-                if (!u) return showToast('Enter a URL or path');
-                updateStateAndSave(
-                  (prev) => ({
-                    ...prev,
-                    srcs: [...prev.srcs, { id: uid('s'), u, k: jsonLinkKind }],
-                  }),
-                  `Added JSON link ${u}`
-                );
-                setJsonLinkUrl('');
-                showToast('JSON Link added');
-              }}
-            >
-              Add Link
-            </button>
+            <div>
+              <small className="sub">Minutes (0 = untimed)</small>
+              <input type="number" min={0} max={600} value={mf.minutes} onChange={(e) => setMf({ ...mf, minutes: Math.max(0, Number(e.target.value) || 0) })} />
+            </div>
           </div>
-
-          <div className="flex flex-col gap-2 mt-3">
-            {state.srcs.map((src) => (
-              <div key={src.id} className="tg">
-                <div>
-                  <b className="font-mono text-xs">{src.u}</b>
-                  <small>{src.k}</small>
-                </div>
-                <div className="flex gap-1">
-                  <button
-                    type="button"
-                    className="b"
-                    onClick={async () => {
-                      try {
-                        const res = await fetch(src.u);
-                        if (!res.ok) throw new Error('Fetch failed');
-                        const data = await res.json();
-                        setMcqJsonInput(JSON.stringify(data, null, 2));
-                        showToast('Fetched link data into import box!');
-                      } catch {
-                        showToast('Could not fetch link (ensure CORS is enabled)');
-                      }
-                    }}
-                  >
-                    Fetch &amp; Import
-                  </button>
-                  <button
-                    type="button"
-                    className="b d"
-                    onClick={() => {
-                      updateStateAndSave(
-                        (prev) => ({
-                          ...prev,
-                          srcs: prev.srcs.filter((s) => s.id !== src.id),
-                        }),
-                        `Removed JSON link ${src.u}`
-                      );
-                      showToast('Link removed');
-                    }}
-                  >
-                    Remove
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
+          {subs.length ? subs.map((s) => (
+            <div className="tg" key={s}>
+              <div>{s}<small>{avail[s]} MCQs available</small></div>
+              <input type="number" min={0} max={avail[s]} style={{ width: 96 }} value={mf.counts[`${course}|${s}`] || 0} onChange={(e) => setMf({ ...mf, counts: { ...mf.counts, [`${course}|${s}`]: Math.max(0, Number(e.target.value) || 0) } })} aria-label={`Questions from ${s}`} />
+            </div>
+          )) : <p className="sub">No MCQ files with subjects in {course || 'this course'} yet. Import MCQ JSON files first.</p>}
+          <button type="button" className="b p mt-3" onClick={() => createMonthly(course, avail)}>Create monthly test</button>
         </div>
-
-        {/* Existing MCQs List */}
         <div className="card">
-          <div className="row">
-            <input
-              type="search"
-              placeholder="Search MCQs by question, topic or course..."
-              value={mcqQuery}
-              onChange={(e) => setMcqQuery(e.target.value)}
-            />
-          </div>
+          <h3>{list.length} monthly {list.length === 1 ? 'test' : 'tests'}</h3>
           <div className="tw">
             <table>
-              <thead>
-                <tr>
-                  <th>Question</th>
-                  <th>Topic</th>
-                  <th>Course</th>
-                  <th>Source</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
+              <thead><tr><th>Name</th><th>Course</th><th>Subjects</th><th>Questions</th><th>Time</th><th /></tr></thead>
               <tbody>
-                {filteredMcqs.length === 0 ? (
-                  <tr>
-                    <td colSpan={5} className="text-center py-6 text-[var(--mut)]">
-                      No MCQs found.
-                    </td>
-                  </tr>
-                ) : (
-                  filteredMcqs.map((m) => (
+                {list.length ? list.map((m) => {
+                  const a = subjCounts(m.course);
+                  const short = m.parts.some((p) => p.count > (a[p.subject] || 0));
+                  return (
                     <tr key={m.id}>
-                      <td>
-                        <span className="font-semibold">{m.q}</span>
-                        <small className="text-[var(--pri)] font-medium">
-                          Answer: {m.o[m.a]}
-                        </small>
-                      </td>
-                      <td>{m.topic}</td>
+                      <td><b>{m.name}</b>{!m.live && <span className="badge pending ml-1">Hidden</span>}{short && <span className="badge banned ml-1">Needs more MCQs</span>}</td>
                       <td>{m.course}</td>
+                      <td className="text-xs">{m.parts.map((p) => `${p.subject} ${p.count}`).join(' · ')}</td>
+                      <td>{m.parts.reduce((n, p) => n + p.count, 0)}</td>
+                      <td>{m.minutes ? `${m.minutes} min` : 'Untimed'}</td>
                       <td>
-                        {m.src ? (
-                          <span className="badge">{m.src}</span>
-                        ) : (
-                          <span className="badge pending">Chances</span>
-                        )}
-                      </td>
-                      <td>
-                        <button
-                          type="button"
-                          className="b d"
-                          onClick={() => {
-                            updateStateAndSave(
-                              (prev) => ({
-                                ...prev,
-                                mcqs: prev.mcqs.filter((x) => x.id !== m.id),
-                              }),
-                              `Deleted MCQ: ${m.q.slice(0, 30)}...`
-                            );
-                            showToast('MCQ deleted');
-                          }}
-                        >
-                          Delete
-                        </button>
+                        <button type="button" className="b" onClick={() => patchEx({ monthly: list.map((x) => (x.id === m.id ? { ...x, live: !x.live } : x)) }, `${m.live ? 'Hid' : 'Showed'} monthly test ${m.name}`)}>{m.live ? 'Hide' : 'Show'}</button>
+                        <button type="button" className="b d" onClick={() => { if (confirm(`Delete "${m.name}"?`)) patchEx({ monthly: list.filter((x) => x.id !== m.id) }, `Deleted monthly test ${m.name}`); }}>Delete</button>
                       </td>
                     </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  const renderRatta = () => {
-    return (
-      <div className="flex flex-col gap-4">
-        <div className="card">
-          <h3>Add a Ratta Revision Card</h3>
-          <textarea
-            placeholder="Card text. Use ______ for the blank space to recall..."
-            value={rattaQ}
-            onChange={(e) => setRattaQ(e.target.value)}
-            className="w-full min-h-[60px]"
-          />
-          <div className="row mt-2.5">
-            <input
-              type="text"
-              placeholder="Answer to fill in blank"
-              value={rattaA}
-              onChange={(e) => setRattaA(e.target.value)}
-            />
-            <input
-              type="text"
-              placeholder="Topic"
-              value={rattaTopic}
-              onChange={(e) => setRattaTopic(e.target.value)}
-            />
-            <select
-              value={rattaCourse}
-              onChange={(e) => setRattaCourse(e.target.value)}
-            >
-              {state.courses.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
-            <input
-              type="text"
-              placeholder="Past paper source (leave empty for Chances)"
-              value={rattaSrc}
-              onChange={(e) => setRattaSrc(e.target.value)}
-            />
-          </div>
-          <button
-            type="button"
-            className="b p mt-2"
-            onClick={() => {
-              if (!rattaQ.trim() || !rattaA.trim()) {
-                return showToast('Add card text and answer');
-              }
-              const newCard: RattaCard = {
-                id: uid('c'),
-                q: rattaQ.trim(),
-                a: rattaA.trim(),
-                topic: rattaTopic.trim() || 'General',
-                course: rattaCourse,
-                src: rattaSrc.trim(),
-              };
-              updateStateAndSave(
-                (prev) => ({ ...prev, ratta: [newCard, ...prev.ratta] }),
-                'Added a Ratta revision card'
-              );
-              setRattaQ('');
-              setRattaA('');
-              setRattaSrc('');
-              showToast('Ratta Card created!');
-            }}
-          >
-            Add Card
-          </button>
-        </div>
-
-        <div className="card">
-          <h3>Bulk JSON Upload for Cards</h3>
-          <textarea
-            placeholder="Paste a JSON array of cards: [{ q: '...', a: '...', topic: '...', course: '...', src: '...' }]"
-            value={rattaJsonInput}
-            onChange={(e) => setRattaJsonInput(e.target.value)}
-          />
-          <div className="flex gap-2 mt-2">
-            <button
-              type="button"
-              className="b"
-              onClick={() => {
-                setRattaJsonInput(
-                  JSON.stringify(
-                    [
-                      {
-                        q: '______ is the powerhouse of the cell.',
-                        a: 'Mitochondria',
-                        topic: 'Cell Biology',
-                        course: 'MDCAT',
-                        src: 'MDCAT 2022',
-                      },
-                    ],
-                    null,
-                    2
-                  )
-                );
-              }}
-            >
-              Load Sample
-            </button>
-            <button
-              type="button"
-              className="b p"
-              onClick={() => {
-                try {
-                  const arr = JSON.parse(rattaJsonInput);
-                  if (!Array.isArray(arr)) return showToast('Must be an array');
-                  let count = 0;
-                  const newCards: RattaCard[] = [];
-                  arr.forEach((item: any) => {
-                    if (item?.q && item?.a) {
-                      newCards.push({
-                        id: uid('c'),
-                        q: String(item.q).trim(),
-                        a: String(item.a).trim(),
-                        topic: item.topic || 'General',
-                        course: item.course || 'General',
-                        src: item.src || '',
-                      });
-                      count++;
-                    }
-                  });
-                  updateStateAndSave(
-                    (prev) => ({ ...prev, ratta: [...newCards, ...prev.ratta] }),
-                    `Imported ${count} Ratta cards`
                   );
-                  setRattaJsonInput('');
-                  showToast(`${count} Ratta cards imported`);
-                } catch {
-                  showToast('Invalid JSON');
-                }
-              }}
-            >
-              Import Cards
-            </button>
-          </div>
-        </div>
-
-        <div className="card">
-          <h3>{state.ratta.length} Cards in Library</h3>
-          <div className="tw">
-            <table>
-              <thead>
-                <tr>
-                  <th>Card Text</th>
-                  <th>Answer</th>
-                  <th>Topic</th>
-                  <th>Source</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {state.ratta.map((card) => (
-                  <tr key={card.id}>
-                    <td>{card.q}</td>
-                    <td>
-                      <b>{card.a}</b>
-                    </td>
-                    <td>
-                      {card.topic} <small>{card.course}</small>
-                    </td>
-                    <td>
-                      {card.src ? (
-                        <span className="badge">{card.src}</span>
-                      ) : (
-                        <span className="badge pending">Chances</span>
-                      )}
-                    </td>
-                    <td>
-                      <button
-                        type="button"
-                        className="b d"
-                        onClick={() => {
-                          updateStateAndSave(
-                            (prev) => ({
-                              ...prev,
-                              ratta: prev.ratta.filter((c) => c.id !== card.id),
-                            }),
-                            'Deleted a Ratta card'
-                          );
-                          showToast('Card deleted');
-                        }}
-                      >
-                        Delete
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                }) : (<tr><td colSpan={6}>No monthly tests yet.</td></tr>)}
               </tbody>
             </table>
           </div>
@@ -1110,6 +1252,99 @@ export default function AdminPage() {
       </div>
     );
   };
+
+  const [sf, setSf] = useState<Strip>(DEFAULT_STRIP);
+  useEffect(() => {
+    if (extras.strip) setSf({ ...DEFAULT_STRIP, ...extras.strip });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [extras.strip?.v]);
+
+  const saveStrip = (on: boolean) => {
+    if (on && !sf.text.trim()) return showToast('Write the message first');
+    const url = sf.linkUrl.trim();
+    if (url && !/^(https?:\/\/|\/)/.test(url)) return showToast('The link must start with https:// or /');
+    const next: Strip = { ...sf, on, text: sf.text.trim(), linkText: sf.linkText.trim(), linkUrl: url, v: Date.now() };
+    setSf(next);
+    patchEx({ strip: next }, on ? 'Published the top strip' : 'Turned the top strip off');
+    showToast(on ? 'Strip is live' : 'Strip is off');
+  };
+  const removeStrip = () => {
+    if (!confirm('Remove the top strip?')) return;
+    setSf(DEFAULT_STRIP);
+    patchEx({ strip: { ...DEFAULT_STRIP, v: Date.now() } }, 'Removed the top strip');
+    showToast('Strip removed');
+  };
+
+  const renderStrip = () => (
+    <div className="card">
+      <h3>
+        Top strip {extras.strip?.on ? <span className="badge">Live</span> : <span className="badge pending">Off</span>}
+      </h3>
+      <p className="sub mb-3">A thin bar above the header on your landing page and student pages. Use it for news, offers or notices.</p>
+      {sf.text.trim() && (
+        <div className="rounded-xl overflow-hidden mb-3 border border-[var(--line)]">
+          <StripBar strip={{ ...sf, on: true }} />
+        </div>
+      )}
+      <textarea className="w-full" style={{ minHeight: 60, fontFamily: 'inherit' }} maxLength={160} placeholder="Message, e.g. The October monthly test is now live" value={sf.text} onChange={(e) => setSf({ ...sf, text: e.target.value })} aria-label="Strip message" />
+      <div className="row mt-2">
+        <input type="text" placeholder="Button text (optional), e.g. Start now" value={sf.linkText} onChange={(e) => setSf({ ...sf, linkText: e.target.value })} />
+        <input type="text" placeholder="Link, e.g. /dashboard or https://..." value={sf.linkUrl} onChange={(e) => setSf({ ...sf, linkUrl: e.target.value })} />
+        <select value={sf.kind} onChange={(e) => setSf({ ...sf, kind: e.target.value as Strip['kind'] })} aria-label="Strip colour">
+          <option value="info">Blue (notice)</option>
+          <option value="warning">Yellow (important)</option>
+          <option value="success">Green (good news)</option>
+        </select>
+      </div>
+      {tg('Let visitors close it', 'They will see it again when you publish a new message', sf.dismissible, (v) => setSf({ ...sf, dismissible: v }))}
+      {tg('Scroll the message', 'Good for long messages', sf.scroll, (v) => setSf({ ...sf, scroll: v }))}
+      <div className="flex gap-2 flex-wrap mt-3">
+        <button type="button" className="b p" onClick={() => saveStrip(true)}>{extras.strip?.on ? 'Update strip' : 'Publish strip'}</button>
+        {extras.strip?.on && <button type="button" className="b" onClick={() => saveStrip(false)}>Turn off</button>}
+        {!!extras.strip?.text && <button type="button" className="b d" onClick={removeStrip}>Remove</button>}
+      </div>
+    </div>
+  );
+
+  const AD_KEYS: [string, string, number][] = [['dash_top', 'Dashboard top banner', 90], ['dash_side', 'Dashboard sidebar', 250], ['mcq', 'MCQ practice page', 90], ['revision', 'Ratta Cards page', 90], ['result', 'Result page', 250], ['between', 'Between questions', 250]];
+  const slotOf = (key: string, h: number): AdSlot => ({ on: false, provider: 'adsense', code: '', height: h, ...(extras.adSlots?.[key] || {}) });
+  const setSlot = (key: string, h: number, patch: Partial<AdSlot>) => patchEx({ adSlots: { ...(extras.adSlots || {}), [key]: { ...slotOf(key, h), ...patch } } }, `Updated ad slot ${key}`);
+
+  const renderAds = () => (
+    <div className="flex flex-col gap-4">
+      <div className="card">
+        {tg('Show ads to students', 'Master switch. When off, every ad area disappears from the student pages', state.ads.on, (v) => updateStateAndSave((prev) => ({ ...prev, ads: { ...prev.ads, on: v } }), `Ads ${v ? 'enabled' : 'disabled'}`))}
+        <details className="mt-2">
+          <summary className="text-sm font-bold cursor-pointer">How to paste your ad code</summary>
+          <ul className="sub list-disc pl-5 mt-2 space-y-1">
+            <li>Google AdSense: paste the full ad unit code (the adsbygoogle script, the ins tag and the push script). Your site must be approved, and you need a public/ads.txt file.</li>
+            <li>Adsterra: paste the full banner or native code exactly as Adsterra gives it. It runs in a protected frame, so set the height to match the banner (90 for 728x90, 250 for 300x250).</li>
+            <li>Use a different provider in each slot if you like. A slot with no code, or switched off, shows nothing.</li>
+          </ul>
+        </details>
+      </div>
+      {AD_KEYS.map(([key, label, h]) => {
+        const s = slotOf(key, h);
+        return (
+          <div className="card" key={key}>
+            {tg(label, !s.on ? 'Off' : !s.code.trim() ? 'On, but no code saved yet' : state.ads.on ? 'Live' : 'Saved, waiting for the master switch', s.on, (v) => setSlot(key, h, { on: v }))}
+            <div className="row mt-2">
+              <select value={s.provider} onChange={(e) => setSlot(key, h, { provider: e.target.value as AdSlot['provider'] })} aria-label="Ad provider">
+                <option value="adsense">Google AdSense</option>
+                <option value="adsterra">Adsterra</option>
+              </select>
+              <input type="number" min={40} max={800} value={s.height} onChange={(e) => setSlot(key, h, { height: Math.min(800, Math.max(40, Number(e.target.value) || h)) })} aria-label="Ad height in pixels" />
+            </div>
+            <textarea key={`${key}-${s.provider}`} className="w-full" style={{ minHeight: 120 }} defaultValue={s.code} placeholder={s.provider === 'adsense' ? '<script async src="https://pagead2.googlesyndication.com/..."></script>\n<ins class="adsbygoogle" ...></ins>\n<script>(adsbygoogle = window.adsbygoogle || []).push({});</script>' : '<script>atOptions = { key: "...", format: "iframe", height: 90, width: 728, params: {} };</script>\n<script src="//.../invoke.js"></script>'} onBlur={(e) => e.target.value !== s.code && setSlot(key, h, { code: e.target.value })} aria-label="Ad code" />
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  const renderMcqs = () => renderBank('mcq');
+
+  const renderRatta = () => renderBank('ratta');
 
   const renderReports = () => {
     return (
@@ -1211,124 +1446,10 @@ export default function AdminPage() {
     );
   };
 
-  const renderAds = () => {
-    const placements = [
-      ['dash_top', 'Dashboard Top Banner'],
-      ['dash_side', 'Dashboard Sidebar Banner'],
-      ['mcq', 'MCQ Practice Page'],
-      ['revision', 'Ratta Cards Revision Page'],
-      ['result', 'Score Summary Page'],
-      ['between', 'Between Questions Interval'],
-    ] as const;
-
-    return (
-      <div className="flex flex-col gap-4">
-        <div className="card">
-          <div className="tg">
-            <div>
-              <b>Show Ads to Users</b>
-              <small>Master switch for AdSense / Adsterra across the platform</small>
-            </div>
-            <label className="sw">
-              <input
-                type="checkbox"
-                checked={state.ads.on}
-                onChange={(e) => {
-                  updateStateAndSave(
-                    (prev) => ({
-                      ...prev,
-                      ads: { ...prev.ads, on: e.target.checked },
-                    }),
-                    `Master ads switch turned ${e.target.checked ? 'ON' : 'OFF'}`
-                  );
-                  showToast(`Ads ${e.target.checked ? 'Enabled' : 'Disabled'}`);
-                }}
-              />
-              <span />
-            </label>
-          </div>
-
-          <div className="row mt-3">
-            <select
-              value={state.ads.provider}
-              onChange={(e) => {
-                const val = e.target.value as 'adsense' | 'adsterra';
-                updateStateAndSave((prev) => ({
-                  ...prev,
-                  ads: { ...prev.ads, provider: val },
-                }));
-                showToast(`Provider set to ${val}`);
-              }}
-            >
-              <option value="adsense">Google AdSense</option>
-              <option value="adsterra">Adsterra</option>
-            </select>
-          </div>
-
-          <textarea
-            placeholder="Paste your ad unit script / ins tag here..."
-            value={state.ads.code}
-            onChange={(e) => {
-              const code = e.target.value;
-              setState((prev) => ({ ...prev, ads: { ...prev.ads, code } }));
-            }}
-            className="w-full"
-          />
-          <div className="mt-2.5">
-            <button
-              type="button"
-              className="b p"
-              onClick={() => {
-                updateStateAndSave(
-                  (prev) => prev,
-                  `Saved ad script code (${state.ads.provider})`
-                );
-                showToast('Ad script saved');
-              }}
-            >
-              Save Ad Code
-            </button>
-          </div>
-        </div>
-
-        <div className="card">
-          <h3>Ad Placements</h3>
-          {placements.map(([key, label]) => (
-            <div key={key} className="tg">
-              <div>
-                <b>{label}</b>
-                <small>{state.ads.on && state.ads.pl[key] ? 'Visible to students' : 'Hidden'}</small>
-              </div>
-              <label className="sw">
-                <input
-                  type="checkbox"
-                  checked={state.ads.pl[key]}
-                  onChange={(e) => {
-                    const checked = e.target.checked;
-                    updateStateAndSave(
-                      (prev) => ({
-                        ...prev,
-                        ads: {
-                          ...prev.ads,
-                          pl: { ...prev.ads.pl, [key]: checked },
-                        },
-                      }),
-                      `Placement ${key} set to ${checked ? 'ON' : 'OFF'}`
-                    );
-                  }}
-                />
-                <span />
-              </label>
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-  };
-
   const renderAnnouncements = () => {
     return (
       <div className="flex flex-col gap-4">
+        {renderStrip()}
         <div className="card">
           <div className="row">
             <input
@@ -1708,6 +1829,13 @@ export default function AdminPage() {
 
     return (
       <div className="flex flex-col gap-4">
+        <div className="card">
+          <h3>What protects your admin panel</h3>
+          <ul className="sub list-disc pl-5 space-y-1">
+            <li>Enforced by the database: Google sign-in, the admin role, the admin username and password (8-hour session, locked for 15 minutes after 5 wrong tries), bans and suspensions.</li>
+            <li>Saved for reference only, because a static site cannot enforce them: session timeout, rate limit and blocked IPs. Multi-account flags are not detected yet.</li>
+          </ul>
+        </div>
         {/* Anti-Cheat Controls (Requested Feature) */}
         <div className="card">
           <div className="flex justify-between items-center mb-2">
@@ -1881,13 +2009,14 @@ export default function AdminPage() {
         <div className="card">
           <div className="tg">
             <div>
-              <b>Require 2-Factor Authentication for Admins</b>
-              <small>Enforced via Supabase Auth TOTP</small>
+              <b>Admin username and password</b>
+              <small>Always on. The database checks it on top of Google sign-in. Change it from the SQL Editor.</small>
             </div>
             <label className="sw">
               <input
                 type="checkbox"
-                checked={sec.twofa}
+                checked
+                disabled
                 onChange={(e) => {
                   const val = e.target.checked;
                   updateStateAndSave((prev) => ({
@@ -2127,7 +2256,7 @@ export default function AdminPage() {
   };
 
   return (
-    <div className="flex min-h-screen bg-[var(--bg)] text-[var(--ink)]">
+    <div className="flex max-[820px]:flex-col min-h-screen bg-[var(--bg)] text-[var(--ink)]">
       <AdminNav
         currentView={view}
         onSelectView={(v) => {
@@ -2164,7 +2293,11 @@ export default function AdminPage() {
                 ? 'Settings & Protection'
                 : view === 'sec'
                 ? 'Security & Anti-Cheat'
-                : 'System Audit Logs'}
+                : view === 'monthly'
+                ? 'Monthly Tests'
+                : view === 'ana'
+                ? 'Analytics'
+                : 'Audit Logs'}
             </h1>
             <p className="sub">
               {view === 'dash'
@@ -2189,7 +2322,11 @@ export default function AdminPage() {
                 ? 'Test rules, content protection, and data backups'
                 : view === 'sec'
                 ? 'Anti-cheat limits, multi-account detection & blocked IPs'
-                : 'Audit log trail and real-time student activity feed'}
+                : view === 'monthly'
+                ? 'Random tests built from each subject in a course'
+                : view === 'ana'
+                ? 'Traffic sources, views and topic-level engagement from Google Analytics'
+                : 'Record of admin actions and student activity'}
             </p>
           </div>
 
@@ -2222,6 +2359,8 @@ export default function AdminPage() {
         {view === 'flags' && renderFeatures()}
         {view === 'set' && renderSettings()}
         {view === 'sec' && renderSecurity()}
+        {view === 'monthly' && renderMonthly()}
+        {view === 'ana' && renderAnalytics()}
         {view === 'logs' && renderLogs()}
       </main>
 
@@ -2237,5 +2376,104 @@ export default function AdminPage() {
       {/* Toast Notification */}
       {toastMsg && <div className="toast">{toastMsg}</div>}
     </div>
+  );
+}
+
+function AdminLogin({ email, onDone }: { email?: string; onDone: () => void }) {
+  const [u, setU] = useState('');
+  const [p, setP] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const sb = getSupabase();
+    if (!sb || busy) return;
+    setBusy(true);
+    setErr('');
+    try {
+      const r = await sb.rpc('admin_login', { p_user: u, p_pass: p });
+      if (r.error) throw r.error;
+      if (r.data === true) onDone();
+      else setErr('Wrong username or password.');
+    } catch (x) {
+      setErr((x as { message?: string }).message || 'Could not sign in');
+    }
+    setP('');
+    setBusy(false);
+  };
+  return (
+    <div className="min-h-screen grid place-items-center bg-[var(--bg)] text-[var(--ink)] p-4">
+      <form onSubmit={(e) => void submit(e)} className="card w-full max-w-sm">
+        <h1 className="text-xl font-extrabold mb-1">Admin login</h1>
+        <p className="sub mb-4">Signed in as {email}. Enter your admin username and password.</p>
+        <input type="text" autoComplete="username" placeholder="Username" value={u} onChange={(e) => setU(e.target.value)} className="mb-2" aria-label="Username" />
+        <input type="password" autoComplete="current-password" placeholder="Password" value={p} onChange={(e) => setP(e.target.value)} className="mb-3" aria-label="Password" />
+        {err && <p role="alert" className="text-sm mb-3" style={{ color: 'var(--red, #c0392b)' }}>{err}</p>}
+        <button type="submit" className="b p w-full" disabled={busy || !u || !p}>{busy ? 'Checking...' : 'Unlock admin'}</button>
+      </form>
+    </div>
+  );
+}
+
+// Gate: Google sign-in + admin role (database) + admin username and password (database, 8-hour session).
+// Locally, without Supabase keys, the panel opens for testing. A live site without keys stays locked.
+export default function AdminPage() {
+  const user = useUser();
+  const { dark, toggle } = useTheme();
+  const [unlocked, setUnlocked] = useState<boolean | null>(null);
+  const allow = (process.env.NEXT_PUBLIC_ADMIN_EMAILS || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
+  const isAdminUser = user?.role === 'admin' && (allow.length === 0 || (!!user.email && allow.includes(user.email.toLowerCase())));
+
+  const check = useCallback(async () => {
+    const sb = getSupabase();
+    if (!sb) return;
+    const r = await sb.rpc('admin_is_unlocked');
+    setUnlocked(r.data === true);
+  }, []);
+  useEffect(() => {
+    if (isSupabaseConfigured && isAdminUser) void check();
+  }, [isAdminUser, check]);
+  useEffect(() => {
+    if (!isSupabaseConfigured || !unlocked) return;
+    const id = setInterval(() => void check(), 300000); // sends you back to the login when the 8 hours run out
+    return () => clearInterval(id);
+  }, [unlocked, check]);
+
+  const spinner = <div className="min-h-screen grid place-items-center bg-[var(--bg)]"><div className="w-8 h-8 border-4 border-[var(--pri)] border-t-transparent rounded-full animate-spin" /></div>;
+  const locked = (msg: string, link: string, label: string) => (
+    <div className="min-h-screen grid place-items-center bg-[var(--bg)] text-[var(--ink)] p-6">
+      <div className="card max-w-sm text-center">
+        <h1 className="text-xl font-extrabold mb-2">Admins only</h1>
+        <p className="sub mb-4">{msg}</p>
+        <Link href={link} className="b p">{label}</Link>
+      </div>
+    </div>
+  );
+
+  const themeBtn = <button type="button" onClick={toggle} className="b fixed bottom-4 right-4 z-30 shadow" aria-label="Toggle dark mode">{dark ? '☀ Light' : '☾ Dark'}</button>;
+
+  if (!isSupabaseConfigured) {
+    if (process.env.NODE_ENV === 'production') return locked('Admin sign-in is not configured on this site.', '/', 'Back to home');
+    return <><AdminApp />{themeBtn}</>;
+  }
+  if (user === undefined) return spinner;
+  if (!user) return locked('Sign in with your admin Google account to continue.', '/login', 'Sign in');
+  if (!isAdminUser) return locked('This account does not have admin access.', '/', 'Back to home');
+  if (unlocked === null) return spinner;
+  if (!unlocked) return <AdminLogin email={user.email} onDone={() => setUnlocked(true)} />;
+  return (
+    <>
+      <AdminApp />
+      <button
+        type="button"
+        onClick={() => {
+          void getSupabase()?.rpc('admin_logout').then(() => setUnlocked(false));
+        }}
+        className="b fixed bottom-4 left-4 z-30 shadow"
+      >
+        Lock admin
+      </button>
+      {themeBtn}
+    </>
   );
 }

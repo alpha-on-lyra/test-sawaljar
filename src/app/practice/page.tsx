@@ -1,463 +1,347 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, Suspense } from 'react';
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
-import { Navbar } from '@/components/Navbar';
+import StudentShell from '@/components/StudentShell';
 import { AdBanner } from '@/components/AdBanner';
 import { ReportModal } from '@/components/ReportModal';
-import { loadAppState, seedInitialData } from '@/lib/store';
-import { setupAntiCheat } from '@/lib/antiCheat';
-import { MCQ, AppState } from '@/lib/types';
+import { loadAppState, saveAppState, uid } from '@/lib/store';
+import { submitReportToSupabase, logAntiCheatToSupabase } from '@/lib/supabase';
+import { AppState, MCQ } from '@/lib/types';
+import { availableFor, buildMonthly } from '@/lib/monthly';
+import { extrasOf, mcqOpts, shuffle, isHidden } from '@/lib/study';
+import { recordAttempt, getStats, streak } from '@/lib/userStats';
+import { recordSolve } from '@/lib/accounts';
+import { bumpItemStat } from '@/lib/setStats';
+import { useUser, displayName } from '@/lib/useUser';
+import { Ic, icons, heading, focus } from '@/lib/ui';
 
-function PracticeContent() {
-  const searchParams = useSearchParams();
-  const initialCourse = searchParams.get('course') || '';
+type Q = { m: MCQ; order: number[] };
+type Extra = { yt?: string[]; pdf?: string[] };
+const fmt = (s: number) => `${Math.floor(Math.max(0, s) / 60)}:${String(Math.max(0, s) % 60).padStart(2, '0')}`;
 
-  const [state, setState] = useState<AppState>(seedInitialData());
-  const [selectedCourse, setSelectedCourse] = useState(initialCourse);
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [selectedAnswers, setSelectedAnswers] = useState<Record<number, number>>({});
-  const [isSubmitted, setIsSubmitted] = useState(false);
-  const [timeLeft, setTimeLeft] = useState(0);
+function PracticeInner() {
+  const sp = useSearchParams();
+  const course = sp.get('course') || '';
+  const topic = sp.get('topic') || '';
+  const setId = sp.get('set') || '';
+  const monthlyId = sp.get('monthly') || '';
+  const user = useUser();
+  const uidStr = user?.id || user?.email || 'guest';
 
-  // Anti-Cheat State
-  const [cheatWarnings, setCheatWarnings] = useState<string[]>([]);
-  const [tabSwitchCount, setTabSwitchCount] = useState(0);
-
-  // Report Modal State
-  const [reportQuestion, setReportQuestion] = useState<MCQ | null>(null);
+  const [st, setSt] = useState<AppState | null>(null);
+  const [phase, setPhase] = useState<'intro' | 'run' | 'done'>('intro');
+  const [qs, setQs] = useState<Q[]>([]);
+  const [i, setI] = useState(0);
+  const [picked, setPicked] = useState<Record<string, number>>({});
+  const [left, setLeft] = useState(0);
+  const [reportQ, setReportQ] = useState<MCQ | null>(null);
+  const [warn, setWarn] = useState('');
+  const [ended, setEnded] = useState('');
+  const switches = useRef(0);
 
   useEffect(() => {
-    const loaded = loadAppState();
-    setState(loaded);
-    if (!selectedCourse && loaded.courses.length > 0) {
-      setSelectedCourse(loaded.courses[0]);
-    }
+    const load = () => setSt(loadAppState());
+    load();
+    window.addEventListener('storage', load);
+    return () => window.removeEventListener('storage', load);
   }, []);
 
-  // Filter and shuffle questions
-  const questions: MCQ[] = useMemo(() => {
-    let list = state.mcqs.filter((m) => !selectedCourse || m.course === selectedCourse);
-    if (list.length === 0) list = state.mcqs;
+  const ex = st ? extrasOf(st) : {};
+  const opts = st ? mcqOpts(st) : null;
+  const test = (ex.monthly || []).find((t) => t.id === monthlyId && t.live !== false);
+  const set = (ex.mcqSets || []).find((s) => s.id === setId);
+  const subjMap = useMemo(() => {
+    const m: Record<string, string> = {};
+    (extrasOf(st || ({} as AppState)).mcqSets || []).forEach((s) => s.ids.forEach((id) => s.subject && (m[id] = s.subject)));
+    return m;
+  }, [st]);
 
-    if (state.quiz.shuffleQ) {
-      return [...list].sort(() => Math.random() - 0.5);
+  const pool = useCallback((): MCQ[] => {
+    if (!st) return [];
+    const ok = (m: MCQ) => !isHidden(m);
+    if (monthlyId) return test ? buildMonthly(st, test).filter(ok) : [];
+    if (setId) {
+      const ids = new Set(set?.ids || []);
+      return st.mcqs.filter((m) => ids.has(m.id) && ok(m));
     }
-    return list;
-  }, [state.mcqs, selectedCourse, state.quiz.shuffleQ]);
+    return []; // tests only start from a topic file or a monthly test
+  }, [st, monthlyId, test, setId, set, course, topic]);
 
-  // Set up timer
+  const total = !st ? 0 : monthlyId ? (test ? test.parts.reduce((n, p) => n + Math.min(p.count, availableFor(st, test.course, p.subject)), 0) : 0) : pool().length;
+  const title = monthlyId ? test?.name || 'Monthly test' : set?.name || topic || course || 'Practice';
+  const count = monthlyId ? total : Math.min(total, opts?.perSession || total);
+  const exam = !!test || (opts?.secPerQ || 0) > 0;
+  const timedTotal = !!test && test.minutes > 0;
+  const timedEach = !test && (opts?.secPerQ || 0) > 0;
+  const ac = (st?.sec as unknown as { antiCheat?: { enabled: boolean; maxTabSwitches: number; blockCopy: boolean; enforceFullscreen: boolean } } | undefined)?.antiCheat;
+
+  const finish = useCallback((why = '') => {
+    setEnded(why);
+    setPhase('done');
+    if (document.fullscreenElement) void document.exitFullscreen?.();
+  }, []);
+
+  const start = () => {
+    if (!st || !opts) return;
+    let items = pool();
+    if (opts.shuffleQ && !test) items = shuffle(items);
+    items = test ? items : items.slice(0, opts.perSession || items.length);
+    if (!items.length) return;
+    setQs(items.map((m) => ({ m, order: opts.shuffleO ? shuffle(m.o.map((_, k) => k)) : m.o.map((_, k) => k) })));
+    setI(0);
+    setPicked({});
+    setWarn('');
+    setEnded('');
+    switches.current = 0;
+    setLeft(timedTotal ? (test?.minutes || 0) * 60 : opts.secPerQ);
+    setPhase('run');
+    if (exam && ac?.enabled && ac.enforceFullscreen) void document.documentElement.requestFullscreen?.().catch(() => undefined);
+  };
+
+  const cur = qs[i];
+  const pick = cur ? picked[cur.m.id] : undefined;
+  const answered = pick !== undefined;
+
+  const answer = useCallback((di: number) => {
+    const q = qs[i];
+    if (!q || picked[q.m.id] !== undefined) return;
+    const ok = di >= 0 && q.order[di] === q.m.a;
+    setPicked((p) => ({ ...p, [q.m.id]: di }));
+    recordAttempt(uidStr, ok, subjMap[q.m.id] || 'General');
+    bumpItemStat(q.m.id, 'attempts');
+    recordSolve(user?.email, ok, streak(getStats(uidStr)));
+  }, [qs, i, picked, uidStr, user, subjMap]);
+
+  const next = () => (i < qs.length - 1 ? setI(i + 1) : finish());
+
+  // timers
   useEffect(() => {
-    if (state.quiz.qt > 0 && !isSubmitted) {
-      setTimeLeft(state.quiz.qt);
-      const timer = setInterval(() => {
-        setTimeLeft((prev) => {
-          if (prev <= 1) {
-            // Auto advance or submit
-            if (currentIndex < questions.length - 1) {
-              setCurrentIndex((i) => i + 1);
-              return state.quiz.qt;
-            } else {
-              setIsSubmitted(true);
-              return 0;
-            }
-          }
-          return prev - 1;
-        });
-      }, 1000);
-      return () => clearInterval(timer);
-    }
-  }, [currentIndex, state.quiz.qt, isSubmitted, questions.length]);
-
-  // Set up Anti-Cheat Active Engine
+    if (phase !== 'run' || !(timedTotal || timedEach)) return;
+    const id = setInterval(() => setLeft((l) => l - 1), 1000);
+    return () => clearInterval(id);
+  }, [phase, timedTotal, timedEach]);
   useEffect(() => {
-    if (!state.sec.antiCheat.enabled || isSubmitted) return;
+    if (phase === 'run' && timedEach && opts) setLeft(opts.secPerQ);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [i, phase]);
+  useEffect(() => {
+    if (phase !== 'run' || left > 0) return;
+    if (timedTotal) finish('Time is up');
+    else if (timedEach && !answered) answer(-1);
+  }, [left, phase, timedTotal, timedEach, answered, answer, finish]);
+  useEffect(() => {
+    if (phase === 'run' && cur) bumpItemStat(cur.m.id, 'views');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [i, phase]);
 
-    const cleanup = setupAntiCheat({
-      maxTabSwitches: state.sec.antiCheat.maxTabSwitches,
-      preventCopy: state.sec.antiCheat.blockCopy || state.prot.noselect,
-      onWarning: (msg, count) => {
-        setTabSwitchCount(count);
-        setCheatWarnings((prev) => [msg, ...prev.slice(0, 4)]);
-      },
-      onExceededLimit: (count) => {
-        alert(
-          `Anti-Cheat Alert: You have exceeded the maximum allowed tab switches (${count}). Your test has been auto-submitted.`
-        );
-        setIsSubmitted(true);
-      },
-    });
-
-    return cleanup;
-  }, [state.sec.antiCheat, state.prot.noselect, isSubmitted]);
-
-  const currentQ = questions[currentIndex];
-
-  const handleSelectOption = (optionIndex: number) => {
-    if (isSubmitted) return;
-    setSelectedAnswers((prev) => ({
-      ...prev,
-      [currentIndex]: optionIndex,
-    }));
-  };
-
-  const handleNext = () => {
-    if (currentIndex < questions.length - 1) {
-      setCurrentIndex((i) => i + 1);
-      if (state.quiz.qt > 0) setTimeLeft(state.quiz.qt);
-    } else {
-      setIsSubmitted(true);
-    }
-  };
-
-  const handlePrev = () => {
-    if (currentIndex > 0) {
-      setCurrentIndex((i) => i - 1);
-    }
-  };
-
-  // Score Calculations
-  const stats = useMemo(() => {
-    let correct = 0;
-    let wrong = 0;
-    let skipped = 0;
-
-    questions.forEach((q, idx) => {
-      const chosen = selectedAnswers[idx];
-      if (chosen === undefined) {
-        skipped++;
-      } else if (chosen === q.a) {
-        correct++;
-      } else {
-        wrong++;
-      }
-    });
-
-    const accuracy = questions.length > 0 ? Math.round((correct / questions.length) * 100) : 0;
-    const finalScore = state.quiz.neg
-      ? Math.max(0, correct - wrong * 0.25).toFixed(2)
-      : correct;
-
-    return { correct, wrong, skipped, accuracy, finalScore };
-  }, [questions, selectedAnswers, state.quiz.neg]);
-
-  const handleReportSubmit = (reason: string) => {
-    if (!reportQuestion) return;
-    const newReport = {
-      id: 'r_' + Math.random().toString(36).slice(2, 8),
-      mcq: reportQuestion.q,
-      kind: 'MCQ' as const,
-      user: 'Practice Student',
-      reason,
-      status: 'pending' as const,
-      t: Date.now(),
+  // light anti-cheat for exams (monthly tests and timed sessions), driven by the admin Security settings
+  useEffect(() => {
+    if (phase !== 'run' || !exam || !ac?.enabled) return;
+    const log = (eventType: string) => {
+      const c = loadAppState();
+      const entry = { id: uid('ac'), userEmail: user?.email, eventType, testTitle: title, t: Date.now() };
+      saveAppState({ ...c, antiCheatLogs: [entry, ...c.antiCheatLogs].slice(0, 300) } as AppState);
+      void logAntiCheatToSupabase({ eventType, testTitle: title, userEmail: user?.email });
     };
-    setState((prev) => ({
-      ...prev,
-      reports: [newReport, ...prev.reports],
-    }));
+    const vis = () => {
+      if (!document.hidden) return;
+      switches.current += 1;
+      log('tab_switch');
+      const remaining = (ac.maxTabSwitches ?? 3) - switches.current;
+      if (remaining < 0) finish('Session ended: too many tab switches');
+      else setWarn(`Please stay on this tab. ${remaining} warning${remaining === 1 ? '' : 's'} left.`);
+    };
+    const fs = () => {
+      if (ac.enforceFullscreen && !document.fullscreenElement) {
+        log('fullscreen_exit');
+        setWarn('Please stay in fullscreen during the test.');
+      }
+    };
+    const block = (e: Event) => e.preventDefault();
+    document.addEventListener('visibilitychange', vis);
+    document.addEventListener('fullscreenchange', fs);
+    const evs = ac.blockCopy ? ['copy', 'cut', 'contextmenu', 'selectstart'] : [];
+    evs.forEach((e) => document.addEventListener(e, block));
+    return () => {
+      document.removeEventListener('visibilitychange', vis);
+      document.removeEventListener('fullscreenchange', fs);
+      evs.forEach((e) => document.removeEventListener(e, block));
+    };
+  }, [phase, exam, ac, title, user, finish]);
+
+  // keyboard: 1-4 or A-D to answer, Enter or right arrow for next
+  useEffect(() => {
+    if (phase !== 'run' || reportQ) return;
+    const key = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement)?.tagName === 'TEXTAREA' || e.ctrlKey || e.metaKey) return;
+      const k = e.key.toLowerCase();
+      const di = '1234'.includes(k) && k ? Number(k) - 1 : 'abcd'.indexOf(k);
+      if (k.length === 1 && di >= 0 && cur && di < cur.order.length) answer(di);
+      else if ((k === 'enter' || k === 'arrowright') && answered) next();
+    };
+    window.addEventListener('keydown', key);
+    return () => window.removeEventListener('keydown', key);
+  });
+
+  const submitReport = (reason: string) => {
+    if (!reportQ) return;
+    const r = { id: uid('r'), mcq: reportQ.q, kind: 'MCQ' as const, user: displayName(user), reason, status: 'pending' as const, t: Date.now() };
+    const c = loadAppState();
+    saveAppState({ ...c, reports: [r, ...c.reports] });
+    void submitReportToSupabase(r);
   };
+
+  const correct = qs.filter((q) => picked[q.m.id] !== undefined && picked[q.m.id] >= 0 && q.order[picked[q.m.id]] === q.m.a).length;
+  const wrong = qs.filter((q) => picked[q.m.id] !== undefined && !(picked[q.m.id] >= 0 && q.order[picked[q.m.id]] === q.m.a)).length;
+  const score = correct - (opts?.negMark ? wrong * 0.25 : 0);
+  const pct = qs.length ? Math.round((correct / qs.length) * 100) : 0;
+  const C = 2 * Math.PI * 54;
+
+  const card = 'bg-[var(--card)] border border-[var(--line)] rounded-[var(--r)]';
+  const btnP = `inline-flex items-center justify-center gap-2 px-6 py-2.5 rounded-full bg-[var(--pri)] text-[var(--bg)] font-semibold hover:opacity-90 transition-opacity disabled:opacity-40 ${focus}`;
+  const btnS = `inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-full bg-[var(--card)] border border-[var(--line)] font-semibold hover:border-[var(--pri)] transition-colors disabled:opacity-40 ${focus}`;
 
   return (
-    <div className={`min-h-screen flex flex-col bg-[var(--bg)] text-[var(--ink)] ${state.prot.noselect ? 'noselect' : ''}`}>
-      <Navbar siteName={state.site.name} />
-
-      <main className="flex-1 max-w-4xl w-full mx-auto p-4 md:p-6 pb-20">
-        {/* Anti-Cheat Alert Banner */}
-        {cheatWarnings.length > 0 && !isSubmitted && (
-          <div className="mb-4 p-3 bg-red-100 border border-red-300 text-red-800 rounded-xl text-xs flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-sm">⚠️ Anti-Cheat Warning:</span>
-              <span>{cheatWarnings[0]}</span>
+    <StudentShell backHref="/dashboard" backLabel="Dashboard" requireAuth>
+      <main className="max-w-3xl mx-auto px-3 sm:px-6 py-6">
+        <AdBanner placement="mcq" />
+        {!st ? null : phase === 'intro' ? (
+          <div className={`${card} p-6 sm:p-8 text-center`}>
+            <span className="mx-auto mb-4 grid place-items-center w-14 h-14 rounded-2xl bg-[var(--pri2)] text-[var(--pri)]"><Ic className="w-7 h-7">{icons.list}</Ic></span>
+            <h1 className="text-2xl font-bold" style={heading}>{title}</h1>
+            {set && <p className="text-sm text-[var(--mut)] mt-1">{set.subject ? `${set.subject} › ` : ''}{set.topic}</p>}
+            <div className="mt-4 flex flex-wrap justify-center gap-2 text-xs font-semibold">
+              <span className="badge">{count} questions</span>
+              {timedTotal && <span className="badge">{test?.minutes} min</span>}
+              {timedEach && <span className="badge">{opts?.secPerQ}s per question</span>}
+              {opts?.negMark && <span className="badge pending">Negative marking</span>}
+              {exam && ac?.enabled && <span className="badge pending">Exam mode: stay on this tab</span>}
             </div>
-            <span className="font-mono font-bold">
-              Violations: {tabSwitchCount}/{state.sec.antiCheat.maxTabSwitches}
-            </span>
+            {!setId && !monthlyId ? (
+              <p className="mt-6 text-[var(--mut)]">Open a test from a topic on your dashboard to start.</p>
+            ) : monthlyId && !test ? (
+              <p className="mt-6 text-[var(--mut)]">This monthly test is not available right now.</p>
+            ) : count === 0 ? (
+              <p className="mt-6 text-[var(--mut)]">There are no questions here yet. Please check back soon.</p>
+            ) : (
+              <button type="button" onClick={start} className={`${btnP} mt-6`}>Start<Ic className="w-4 h-4">{icons.arrow}</Ic></button>
+            )}
+            <div className="mt-4"><Link href="/dashboard" className="text-sm font-semibold text-[var(--mut)] hover:text-[var(--ink)]">Back to dashboard</Link></div>
           </div>
-        )}
-
-        {/* Ad placement if enabled */}
-        <AdBanner placement="mcq" adsConfig={state.ads} />
-
-        {/* Course Filter Bar */}
-        <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-semibold text-[var(--mut)]">Course:</span>
-            <select
-              value={selectedCourse}
-              onChange={(e) => {
-                setSelectedCourse(e.target.value);
-                setCurrentIndex(0);
-                setSelectedAnswers({});
-                setIsSubmitted(false);
-              }}
-              className="text-xs font-semibold py-1.5 px-3 rounded-lg border bg-[var(--card)]"
-            >
-              <option value="">All Courses ({state.mcqs.length})</option>
-              {state.courses.map((c) => (
-                <option key={c} value={c}>
-                  {c} ({state.mcqs.filter((m) => m.course === c).length})
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {state.quiz.qt > 0 && !isSubmitted && (
-            <div className="flex items-center gap-2 font-mono font-bold text-sm bg-[var(--card)] px-3 py-1 rounded-lg border border-[var(--line)]">
-              <span>⏱️</span>
-              <span className={timeLeft <= 10 ? 'text-[var(--red)] animate-pulse' : 'text-[var(--pri)]'}>
-                {timeLeft}s
-              </span>
-            </div>
-          )}
-
-          <div className="text-xs text-[var(--mut)] font-semibold">
-            Question {questions.length > 0 ? currentIndex + 1 : 0} of {questions.length}
-          </div>
-        </div>
-
-        {/* Questions Display or Result Card */}
-        {questions.length === 0 ? (
-          <div className="card text-center py-12">
-            <h3 className="text-lg font-bold mb-2">No Questions Available</h3>
-            <p className="sub mb-4">No MCQs have been added for this category yet.</p>
-            <Link href="/admin" className="b p text-xs">
-              Go to Admin to Import MCQs →
-            </Link>
-          </div>
-        ) : !isSubmitted ? (
-          /* Active Question Card */
-          <div className="card p-6 md:p-8">
-            <div className="flex justify-between items-start gap-4 mb-4">
-              <div>
-                <span className="badge mr-2">{currentQ.course}</span>
-                <span className="text-xs text-[var(--mut)] font-semibold">{currentQ.topic}</span>
+        ) : phase === 'run' && cur ? (
+          <div className="flex flex-col gap-4">
+            <div>
+              <div className="flex items-center justify-between text-sm font-semibold">
+                <span className="truncate pr-3">{title}</span>
+                <span className="flex items-center gap-3 shrink-0">
+                  {(timedTotal || timedEach) && !answered && <span className={`inline-flex items-center gap-1 ${left <= 10 ? 'text-[var(--bad)]' : 'text-[var(--mut)]'}`}><Ic className="w-4 h-4">{icons.clock}</Ic>{fmt(left)}</span>}
+                  <span className="text-[var(--mut)]">{i + 1} / {qs.length}</span>
+                </span>
               </div>
-              <button
-                type="button"
-                onClick={() => setReportQuestion(currentQ)}
-                className="text-xs text-[var(--mut)] hover:text-[var(--red)] transition-colors cursor-pointer"
-                title="Report issue with question"
-              >
-                ⚑ Report
-              </button>
+              <div className="mt-2 h-2 rounded-full bg-[var(--line)] overflow-hidden"><div className="h-full rounded-full bg-[var(--pri)] transition-all" style={{ width: `${((i + (answered ? 1 : 0)) / qs.length) * 100}%` }} /></div>
             </div>
+            {warn && <div role="alert" className="px-4 py-3 rounded-xl text-sm font-semibold border border-[var(--bad)] bg-[var(--badbg)] text-[var(--bad)]">{warn}</div>}
 
-            <h2 className="text-lg md:text-xl font-bold mb-6 leading-snug">
-              {currentQ.q}
-            </h2>
+            <div className={`${card} p-5 sm:p-6`}>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="badge">{subjMap[cur.m.id] ? `${subjMap[cur.m.id]} › ` : ''}{cur.m.topic}</span>
+                  <span className="badge pending">{cur.m.src ? `Past paper: ${cur.m.src}` : 'Chances'}</span>
+                </div>
+                <button type="button" onClick={() => setReportQ(cur.m)} className={`inline-flex items-center gap-1 font-semibold text-[var(--mut)] hover:text-[var(--bad)] ${focus}`}><Ic className="w-4 h-4">{icons.flag}</Ic>Report</button>
+              </div>
+              <h2 className="mt-4 text-lg sm:text-xl font-bold leading-snug select-text" style={heading}>{cur.m.q}</h2>
+              <div className="mt-5 flex flex-col gap-2.5" role="group" aria-label="Answer options">
+                {cur.order.map((oi, di) => {
+                  const good = oi === cur.m.a;
+                  const cls = answered ? (good ? 'border-[var(--ok)] bg-[var(--okbg)]' : di === pick ? 'border-[var(--bad)] bg-[var(--badbg)]' : 'border-[var(--line)] bg-[var(--bg)] opacity-70') : 'border-[var(--line)] bg-[var(--bg)] hover:border-[var(--pri)]';
+                  return (
+                    <button key={di} type="button" disabled={answered} onClick={() => answer(di)} className={`w-full flex items-center gap-3 text-left px-4 py-3 rounded-xl border transition-colors ${cls} ${focus}`}>
+                      <span className={`grid place-items-center w-7 h-7 shrink-0 rounded-full text-xs font-bold ${answered && good ? 'bg-[var(--ok)] text-[var(--bg)]' : answered && di === pick ? 'bg-[var(--bad)] text-[var(--bg)]' : 'bg-[var(--card)] text-[var(--mut)] border border-[var(--line)]'}`}>{'ABCD'[di] || di + 1}</span>
+                      <span className="min-w-0 break-words">{cur.m.o[oi]}</span>
+                      {answered && good && <span className="ml-auto text-[var(--ok)]"><Ic>{icons.check}</Ic></span>}
+                    </button>
+                  );
+                })}
+              </div>
 
-            {/* Options List */}
-            <div className="flex flex-col gap-3 mb-6">
-              {currentQ.o.map((opt, optIdx) => {
-                const isSelected = selectedAnswers[currentIndex] === optIdx;
-                const showExplanation = state.quiz.expl && selectedAnswers[currentIndex] !== undefined;
-                const isCorrect = optIdx === currentQ.a;
-
-                let optClass = 'border-[var(--line)] bg-[var(--card)] hover:border-[var(--pri)]';
-                if (showExplanation) {
-                  if (isCorrect) {
-                    optClass = 'border-green-600 bg-green-50 text-green-900 dark:bg-green-950/40 dark:border-green-700';
-                  } else if (isSelected) {
-                    optClass = 'border-red-500 bg-red-50 text-red-900 dark:bg-red-950/40 dark:border-red-700';
-                  }
-                } else if (isSelected) {
-                  optClass = 'border-[var(--pri)] bg-[var(--pri2)] font-semibold';
-                }
-
-                return (
-                  <button
-                    key={optIdx}
-                    type="button"
-                    onClick={() => handleSelectOption(optIdx)}
-                    className={`w-full text-left p-4 rounded-xl border transition-all flex items-center justify-between cursor-pointer ${optClass}`}
-                  >
-                    <div className="flex items-center gap-3">
-                      <span className="w-7 h-7 rounded-lg border border-[var(--line)] flex items-center justify-center font-bold text-xs bg-[var(--bg)] flex-shrink-0">
-                        {String.fromCharCode(65 + optIdx)}
-                      </span>
-                      <span className="text-sm font-medium">{opt}</span>
+              {answered && (
+                <div className="mt-5 pt-4 border-t border-[var(--line)] flex flex-col gap-3">
+                  <p className={`font-bold ${pick === -1 ? 'text-[var(--mut)]' : cur.order[pick] === cur.m.a ? 'text-[var(--ok)]' : 'text-[var(--bad)]'}`}>
+                    {pick === -1 ? 'Time is up for this question.' : cur.order[pick] === cur.m.a ? 'Correct' : 'Not quite'}
+                  </p>
+                  {opts?.showExp && cur.m.exp && <p className="text-sm text-[var(--mut)] leading-relaxed">{cur.m.exp}</p>}
+                  {([...(((cur.m as unknown as Extra).yt) || []).map((u) => ['yt', u]), ...(((cur.m as unknown as Extra).pdf) || []).map((u) => ['pdf', u])] as [string, string][]).length > 0 && (
+                    <div className="flex flex-wrap gap-2">
+                      {([...(((cur.m as unknown as Extra).yt) || []).map((u) => ['yt', u]), ...(((cur.m as unknown as Extra).pdf) || []).map((u) => ['pdf', u])] as [string, string][]).map(([k, u]) => (
+                        <a key={u} href={u} target="_blank" rel="noopener noreferrer" className={`inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full border border-[var(--line)] hover:opacity-80 ${focus}`} style={k === 'yt' ? { background: 'var(--ybg)', color: 'var(--yfg)' } : { background: 'var(--pbg)', color: 'var(--pfg)' }}>
+                          <Ic className="w-4 h-4">{k === 'yt' ? icons.play : icons.pdf}</Ic>{k === 'yt' ? 'Watch a video' : 'Read the notes'}
+                        </a>
+                      ))}
                     </div>
-
-                    {showExplanation && (
-                      <span>
-                        {isCorrect ? '✓' : isSelected ? '✕' : ''}
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
+                  )}
+                </div>
+              )}
             </div>
 
-            {/* Explanation box if enabled and answered */}
-            {state.quiz.expl && selectedAnswers[currentIndex] !== undefined && currentQ.exp && (
-              <div className="p-4 bg-[var(--pri2)] text-[var(--ink)] rounded-xl border border-[var(--line)] text-xs mb-6">
-                <b className="text-[var(--pri)] block mb-1">Explanation:</b>
-                <p className="leading-relaxed">{currentQ.exp}</p>
-              </div>
-            )}
-
-            {/* Source Tag */}
-            {currentQ.src && (
-              <div className="text-[11px] text-[var(--mut)] mb-4">
-                Past Paper Source: <span className="font-semibold">{currentQ.src}</span>
-              </div>
-            )}
-
-            {/* Navigation buttons */}
-            <div className="flex justify-between items-center pt-4 border-t border-[var(--line)]">
-              <button
-                type="button"
-                onClick={handlePrev}
-                disabled={currentIndex === 0}
-                className="b disabled:opacity-30 disabled:cursor-not-allowed text-xs"
-              >
-                ← Previous
-              </button>
-
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => setIsSubmitted(true)}
-                  className="b text-xs text-[var(--red)]"
-                >
-                  End Test
-                </button>
-                <button
-                  type="button"
-                  onClick={handleNext}
-                  className="b p text-xs px-5"
-                >
-                  {currentIndex === questions.length - 1 ? 'Submit & Review' : 'Next Question →'}
-                </button>
-              </div>
+            {answered && (i + 1) % 5 === 0 && <AdBanner placement="between" />}
+            <div className="flex items-center justify-between gap-3">
+              <button type="button" onClick={() => setI(i - 1)} disabled={i === 0} className={btnS}><Ic className="w-4 h-4">{icons.left}</Ic>Previous</button>
+              <button type="button" onClick={() => finish()} className="text-sm font-semibold text-[var(--mut)] hover:text-[var(--ink)]">End test</button>
+              <button type="button" onClick={next} disabled={!answered} className={btnP}>{i === qs.length - 1 ? 'Finish' : 'Next'}<Ic className="w-4 h-4">{icons.right}</Ic></button>
             </div>
           </div>
         ) : (
-          /* Results Summary Card */
-          <div className="card p-6 md:p-8">
-            <h2 className="text-2xl font-extrabold mb-1 text-center">Test Complete!</h2>
-            <p className="sub text-center mb-6">Here is your detailed performance breakdown</p>
-
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-              <div className="stat text-center">
-                <span>Score</span>
-                <b className="text-[var(--pri)]">{stats.finalScore}</b>
+          <div className="flex flex-col gap-4">
+            <div className={`${card} p-6 sm:p-8 text-center`}>
+              <h1 className="text-2xl font-bold" style={heading}>{ended || 'Test complete'}</h1>
+              <p className="text-sm text-[var(--mut)] mt-1">{title}</p>
+              <svg viewBox="0 0 140 140" className="w-40 h-40 mx-auto mt-4" role="img" aria-label={`${pct}% correct`}>
+                <circle cx="70" cy="70" r="54" fill="none" stroke="var(--line)" strokeWidth="14" />
+                <circle cx="70" cy="70" r="54" fill="none" stroke="var(--pri)" strokeWidth="14" strokeLinecap="round" strokeDasharray={`${(C * pct) / 100} ${C}`} transform="rotate(-90 70 70)" />
+                <text x="70" y="77" textAnchor="middle" fontSize="28" fontWeight="800" fill="var(--ink)">{pct}%</text>
+              </svg>
+              <div className="mt-4 grid grid-cols-3 gap-3 max-w-sm mx-auto text-center">
+                {([['Correct', correct], ['Wrong', wrong], ['Skipped', qs.length - correct - wrong]] as [string, number][]).map(([l, v]) => (
+                  <div key={l} className="rounded-xl bg-[var(--bg)] border border-[var(--line)] py-3"><div className="text-xl font-bold" style={heading}>{v}</div><div className="text-xs text-[var(--mut)]">{l}</div></div>
+                ))}
               </div>
-              <div className="stat text-center">
-                <span>Accuracy</span>
-                <b>{stats.accuracy}%</b>
-              </div>
-              <div className="stat text-center">
-                <span>Correct</span>
-                <b className="text-green-600">{stats.correct}</b>
-              </div>
-              <div className="stat text-center">
-                <span>Wrong</span>
-                <b className="text-[var(--red)]">{stats.wrong}</b>
+              {opts?.negMark && <p className="mt-3 text-sm text-[var(--mut)]">Score with negative marking: <b>{score.toFixed(2)}</b></p>}
+              <div className="mt-6 flex flex-wrap justify-center gap-3">
+                {opts?.retake !== false && <button type="button" onClick={start} className={btnP}>Try again</button>}
+                <Link href="/dashboard" className={btnS}>Dashboard</Link>
               </div>
             </div>
-
-            {state.quiz.neg && (
-              <p className="text-xs text-center text-[var(--mut)] mb-6">
-                * Negative marking applied: -0.25 marks per incorrect response.
-              </p>
+            <AdBanner placement="result" />
+            {wrong > 0 && (
+              <div className={`${card} p-5`}>
+                <h2 className="font-bold mb-3" style={heading}>Review your mistakes</h2>
+                <div className="flex flex-col gap-3">
+                  {qs.filter((q) => picked[q.m.id] !== undefined && !(picked[q.m.id] >= 0 && q.order[picked[q.m.id]] === q.m.a)).map((q) => (
+                    <div key={q.m.id} className="rounded-xl border border-[var(--line)] bg-[var(--bg)] p-4 text-sm">
+                      <p className="font-semibold">{q.m.q}</p>
+                      <p className="mt-1 text-[var(--ok)]">Correct answer: {q.m.o[q.m.a]}</p>
+                      {picked[q.m.id] >= 0 && <p className="text-[var(--bad)]">Your answer: {q.m.o[q.order[picked[q.m.id]]]}</p>}
+                      {q.m.exp && <p className="mt-1 text-[var(--mut)]">{q.m.exp}</p>}
+                    </div>
+                  ))}
+                </div>
+              </div>
             )}
-
-            {/* Review of all questions */}
-            <h3 className="font-bold text-base mb-3">Question Review</h3>
-            <div className="flex flex-col gap-3 mb-6 max-h-96 overflow-y-auto pr-1">
-              {questions.map((q, idx) => {
-                const userAns = selectedAnswers[idx];
-                const isCorrect = userAns === q.a;
-                const isSkipped = userAns === undefined;
-
-                return (
-                  <div
-                    key={q.id}
-                    className={`p-4 rounded-xl border ${
-                      isCorrect
-                        ? 'border-green-300 bg-green-50/50 dark:bg-green-950/20'
-                        : isSkipped
-                        ? 'border-[var(--line)] bg-[var(--card)]'
-                        : 'border-red-300 bg-red-50/50 dark:bg-red-950/20'
-                    }`}
-                  >
-                    <div className="flex justify-between items-start gap-2 mb-1">
-                      <span className="font-semibold text-xs">
-                        {idx + 1}. {q.q}
-                      </span>
-                      <span
-                        className={`badge text-[10px] ${
-                          isCorrect ? '' : isSkipped ? 'pending' : 'rejected'
-                        }`}
-                      >
-                        {isCorrect ? 'Correct' : isSkipped ? 'Skipped' : 'Incorrect'}
-                      </span>
-                    </div>
-
-                    <div className="text-xs text-[var(--mut)] mt-1">
-                      <div>Correct Answer: <b>{q.o[q.a]}</b></div>
-                      {userAns !== undefined && !isCorrect && (
-                        <div className="text-[var(--red)]">
-                          Your Answer: {q.o[userAns]}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="flex justify-center gap-3">
-              {state.quiz.retake && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedAnswers({});
-                    setCurrentIndex(0);
-                    setIsSubmitted(false);
-                    setCheatWarnings([]);
-                    setTabSwitchCount(0);
-                  }}
-                  className="b p text-xs px-6 py-2.5"
-                >
-                  ↻ Retake Test
-                </button>
-              )}
-              <Link href="/courses" className="b text-xs px-6 py-2.5">
-                Practice Another Course
-              </Link>
-            </div>
           </div>
         )}
       </main>
-
-      {/* Report Modal */}
-      {reportQuestion && (
-        <ReportModal
-          isOpen={Boolean(reportQuestion)}
-          questionText={reportQuestion.q}
-          kind="MCQ"
-          onClose={() => setReportQuestion(null)}
-          onSubmit={handleReportSubmit}
-        />
-      )}
-    </div>
+      {reportQ && <ReportModal isOpen questionText={reportQ.q} kind="MCQ" onClose={() => setReportQ(null)} onSubmit={submitReport} />}
+    </StudentShell>
   );
 }
 
 export default function PracticePage() {
   return (
-    <Suspense
-      fallback={
-        <div className="min-h-screen flex items-center justify-center p-6 text-sm font-semibold text-[var(--mut)]">
-          Loading practice questions...
-        </div>
-      }
-    >
-      <PracticeContent />
+    <Suspense fallback={<div className="min-h-screen grid place-items-center text-sm font-semibold text-[var(--mut)]">Loading...</div>}>
+      <PracticeInner />
     </Suspense>
   );
 }

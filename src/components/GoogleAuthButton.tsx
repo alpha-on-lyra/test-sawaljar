@@ -64,3 +64,5 @@ export function GoogleAuthButton({
     </button>
   );
 }
+
+export default GoogleAuthButton;

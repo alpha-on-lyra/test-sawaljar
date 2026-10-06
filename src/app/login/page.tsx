@@ -1,42 +1,35 @@
 'use client';
 
-import React from 'react';
-import Link from 'next/link';
-import { GoogleAuthButton } from '@/components/GoogleAuthButton';
+import React, { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import GoogleAuthButton from '@/components/GoogleAuthButton';
+import JarArt from '@/components/JarArt';
+import StudentShell from '@/components/StudentShell';
+import { useUser } from '@/lib/useUser';
+import { Ic, icons, heading } from '@/lib/ui';
 
 export default function LoginPage() {
+  const router = useRouter();
+  const user = useUser();
+  useEffect(() => {
+    if (user) router.replace('/dashboard');
+  }, [user, router]);
+
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-[var(--bg)] text-[var(--ink)]">
-      <div className="card max-w-md w-full p-8 shadow-sm text-center">
-        <Link href="/" className="inline-block font-extrabold text-2xl tracking-tight mb-2">
-          Sawal<b className="text-[var(--pri)]">Jar</b>
-        </Link>
-        <h1 className="text-xl font-bold mb-1">Welcome Back</h1>
-        <p className="sub mb-8">Sign in to save test progress, streaks, and access the leaderboard</p>
-
-        <div className="flex flex-col gap-4">
-          <GoogleAuthButton
-            label="Continue with Google"
-            redirectTo="/admin"
-            className="w-full py-3.5"
-          />
-
-          <div className="p-3 bg-[var(--bg)] rounded-xl border border-[var(--line)] text-left text-xs text-[var(--mut)]">
-            <div className="font-bold text-[var(--ink)] mb-1 flex items-center gap-1.5">
-              <span>🛡️</span> Security &amp; Anti-Abuse Notice
-            </div>
-            <p className="leading-relaxed">
-              We exclusively support secure <b>Google Authentication</b> to prevent multiple account spamming and protect test integrity. One active device per student session is enforced.
-            </p>
-          </div>
+    <StudentShell>
+      <main className="max-w-5xl mx-auto px-6 py-12 md:py-20 grid md:grid-cols-2 gap-10 items-center">
+        <div>
+          <h1 className="text-3xl sm:text-4xl font-bold tracking-tight leading-tight" style={heading}>Welcome to SawalJar</h1>
+          <p className="mt-3 text-[var(--mut)] max-w-md">Sign in with Google to save your progress, keep your streak and see your statistics. No passwords to remember.</p>
+          <div className="mt-8 max-w-sm"><GoogleAuthButton /></div>
+          <ul className="mt-8 space-y-2 text-sm text-[var(--mut)]">
+            {['Free MCQs and Ratta Cards', 'Your results stay saved', 'One tap to sign in'].map((t) => (
+              <li key={t} className="flex items-center gap-2"><span className="text-[var(--pri)]"><Ic className="w-4 h-4">{icons.check}</Ic></span>{t}</li>
+            ))}
+          </ul>
         </div>
-
-        <div className="mt-8 pt-4 border-t border-[var(--line)] text-xs text-[var(--mut)]">
-          <Link href="/" className="hover:underline">
-            ← Return to Home Page
-          </Link>
-        </div>
-      </div>
-    </div>
+        <div className="flex justify-center"><JarArt variant="hook" className="w-60 sm:w-72 h-auto" /></div>
+      </main>
+    </StudentShell>
   );
 }

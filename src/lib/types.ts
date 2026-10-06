@@ -1,11 +1,37 @@
 export type Role = 'user' | 'admin';
 export type UserStatus = 'active' | 'suspended' | 'banned';
 
+export interface TopicResource {
+  id: string;
+  type: 'youtube' | 'pdf' | 'notes';
+  title: string;
+  url: string; // YouTube embed link or PDF URL
+}
+
+export interface Topic {
+  id: string;
+  courseName: string;
+  name: string;
+  description?: string;
+  sortOrder?: number;
+  resources: TopicResource[];
+}
+
+export interface Course {
+  id: string;
+  name: string;
+  slug: string;
+  badge: string; // e.g. "Medical", "Engineering", "Board Exams"
+  description: string;
+  icon: string; // e.g. '🧬', '⚙️', '🔬', '📐'
+  color: string;
+}
+
 export interface User {
   id: string;
   name: string;
   email: string;
-  course: string;
+  course: string; // One active enrolled course per user!
   status: UserStatus;
   role?: Role;
   last: number; // timestamp
@@ -105,6 +131,7 @@ export interface FeatureFlags {
 export interface MaintenanceConfig {
   on: boolean;
   msg: string;
+  eta?: string;
 }
 
 export interface QuizConfig {
@@ -145,7 +172,8 @@ export interface SecurityConfig {
 }
 
 export interface AppState {
-  courses: string[];
+  courses: Course[];
+  topics: Topic[];
   users: User[];
   mcqs: MCQ[];
   ratta: RattaCard[];

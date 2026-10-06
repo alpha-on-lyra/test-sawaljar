@@ -1,0 +1,32 @@
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: SAMEORIGIN
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+
+/admin*
+  X-Robots-Tag: noindex, nofollow
+  X-Frame-Options: DENY
+  Cache-Control: no-store
+
+/dashboard*
+  X-Robots-Tag: noindex, nofollow
+/practice*
+  X-Robots-Tag: noindex, nofollow
+/ratta*
+  X-Robots-Tag: noindex, nofollow
+/stats*
+  X-Robots-Tag: noindex, nofollow
+/leaderboard*
+  X-Robots-Tag: noindex, nofollow
+/announcements*
+  X-Robots-Tag: noindex, nofollow
+/login*
+  X-Robots-Tag: noindex, nofollow
+
+/api/*
+  X-Robots-Tag: noindex
+  Cache-Control: no-store
+
+/_next/static/*
+  Cache-Control: public, max-age=31536000, immutable

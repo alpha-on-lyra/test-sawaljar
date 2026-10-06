@@ -77,3 +77,5 @@ export function ReportModal({
     </div>
   );
 }
+
+export default ReportModal;
