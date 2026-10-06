@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build --webpack && node ./node_modules/@opennextjs/cloudflare/dist/cli.js build",
+    "build": "next build --webpack",
+    "postbuild": "opennextjs-cloudflare build",
     "start": "next start",
     "lint": "eslint"
   },
