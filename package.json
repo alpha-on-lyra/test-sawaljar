@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build --webpack",
-    "postbuild": "opennextjs-cloudflare build",
+    "postbuild": "npx opennextjs-cloudflare build",
     "start": "next start",
     "lint": "eslint"
   },
