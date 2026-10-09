@@ -1,4 +1,4 @@
-import { getSupabase, getCurrentUser, isSupabaseConfigured } from '@/lib/supabase';
+import { getSupabase, getCurrentUser, getBootstrap, isSupabaseConfigured } from '@/lib/supabase';
 import { loadAppState, writeLocalState, setSaveHook } from '@/lib/store';
 import type { AppState } from '@/lib/types';
 import type { Stats } from '@/lib/userStats';
@@ -44,6 +44,7 @@ const writeVer = (v: Record<string, string>) => {
   }
 };
 
+export const PULL_EVERY = 600000;
 let ready = false; // first successful pull done
 let snap: Record<string, string> = {};
 let userSnap: UserSnap = {};
@@ -63,16 +64,13 @@ async function doPull() {
   if (!sb) return;
   set({ mode: 'syncing' });
   try {
-    const me = (await getCurrentUser()) as { role?: string; status?: string } | null;
+    // ONE request: who is signed in, whether the admin password step is done, and which content changed
+    const boot = await getBootstrap(true);
+    if (!boot) throw new Error('Could not reach Supabase. Check the project URL and key, and that supabase-setup.sql was run.');
+    const me = boot.profile;
     let role: CloudStatus['role'] = me ? 'user' : 'none';
-    if (me && me.role === 'admin' && me.status === 'active') {
-      const unlocked = await sb.rpc('admin_is_unlocked'); // admin role AND the admin username and password were entered
-      if (unlocked.data === true) role = 'admin';
-    }
-
-    const meta = await sb.from('content').select('key,updated_at');
-    if (meta.error) throw meta.error;
-    const metaRows = (meta.data || []) as { key: string; updated_at: string }[];
+    if (me && me.role === 'admin' && me.status === 'active' && boot.unlocked) role = 'admin';
+    const metaRows = boot.versions;
     const ver = readVer();
     const first = Object.keys(ver).length === 0;
     const changed = metaRows.filter((r) => ver[r.key] !== r.updated_at).map((r) => r.key);
@@ -133,7 +131,7 @@ async function doPull() {
 export function syncFromCloud(force = false): Promise<void> {
   if (!isSupabaseConfigured || typeof window === 'undefined') return Promise.resolve();
   if (pushTimer || pushing) return Promise.resolve(); // never overwrite edits that are still being saved
-  if (!force && Date.now() - lastPull < 20000) return Promise.resolve();
+  if (!force && Date.now() - lastPull < PULL_EVERY) return Promise.resolve(); // at most one check every 10 minutes, however many pages are opened
   if (!pulling) pulling = doPull().finally(() => (pulling = null));
   return pulling;
 }
@@ -248,22 +246,25 @@ export async function cloudBumpSet(setId: string, field: 'views' | 'attempts') {
 }
 export async function cloudTouch(course: string) {
   const sb = getSupabase();
-  if (sb) await sb.rpc('touch_me', { p_course: course });
+  if (!sb || !course) return;
+  const day = `${course}|${new Date().toLocaleDateString('en-CA')}`;
+  try {
+    if (localStorage.getItem('sj_touch') === day) return; // already recorded today
+    localStorage.setItem('sj_touch', day);
+  } catch {
+    // storage unavailable: just send it
+  }
+  await sb.rpc('touch_me', { p_course: course });
 }
 export async function cloudMyStats(): Promise<Stats | null> {
   const sb = getSupabase();
-  const me = (await getCurrentUser()) as { id?: string } | null;
-  if (!sb || !me?.id) return null;
-  const since = new Date(Date.now() - 60 * 86400000).toLocaleDateString('en-CA');
-  const [p, d, s] = await Promise.all([
-    sb.from('profiles').select('solved,correct').eq('id', me.id).maybeSingle(),
-    sb.from('user_daily_stats').select('day,attempted,correct').eq('user_id', me.id).gte('day', since),
-    sb.from('user_subject_stats').select('subject,attempted,correct').eq('user_id', me.id),
-  ]);
-  if (p.error || !p.data) return null;
-  const out: Stats = { attempted: p.data.solved || 0, correct: p.data.correct || 0, byDay: {}, bySubject: {} };
-  (d.data || []).forEach((r) => (out.byDay[r.day as string] = { a: r.attempted as number, c: r.correct as number }));
-  (s.data || []).forEach((r) => (out.bySubject[r.subject as string] = { a: r.attempted as number, c: r.correct as number }));
+  if (!sb) return null;
+  const r = await sb.rpc('my_stats'); // one request for the whole Statistics page
+  if (r.error || !r.data) return null;
+  const d = r.data as { solved: number; correct: number; days: { day: string; a: number; c: number }[]; subjects: { s: string; a: number; c: number }[] };
+  const out: Stats = { attempted: d.solved || 0, correct: d.correct || 0, byDay: {}, bySubject: {} };
+  d.days.forEach((x) => (out.byDay[x.day] = { a: x.a, c: x.c }));
+  d.subjects.forEach((x) => (out.bySubject[x.s] = { a: x.a, c: x.c }));
   return out;
 }
 export async function cloudLeaderboard(course: string) {
@@ -290,4 +291,20 @@ export async function cloudCleanup(): Promise<string> {
   const r = await sb.rpc('admin_cleanup');
   if (r.error) throw r.error;
   return String(r.data);
+}
+
+// ---------- statistics only: the questions themselves are never stored in Supabase ----------
+export type BatchItem = { s: string; j: string; k: string; ok: boolean };
+export async function cloudRecordBatch(profile: boolean, items: BatchItem[], views: string[], course: string, logs: { e: string; t: string }[]) {
+  const sb = getSupabase();
+  if (!sb || (!items.length && !views.length && !logs.length)) return;
+  const r = await sb.rpc('record_batch', { p_profile: profile, p_items: items.slice(0, 300), p_views: views.slice(0, 20), p_course: course || null, p_logs: logs.slice(0, 20) });
+  if (r.error) throw r.error;
+}
+export async function cloudQuestionStats(setId: string): Promise<{ qkey: string; attempts: number; correct: number }[]> {
+  const sb = getSupabase();
+  if (!sb) return [];
+  const r = await sb.from('question_stats').select('qkey,attempts,correct').eq('set_id', setId).limit(2000);
+  if (r.error) throw r.error;
+  return (r.data || []) as { qkey: string; attempts: number; correct: number }[];
 }

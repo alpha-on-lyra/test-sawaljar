@@ -1,7 +1,7 @@
 import type { AppState } from '@/lib/types';
 import type { MonthlyTest } from '@/lib/monthly';
 
-export type SetLite = { id: string; name: string; course: string; subject?: string; topic: string; ids: string[]; yt?: { title: string; url: string }[]; pdf?: { title: string; url: string }[] };
+export type SetLite = { id: string; name: string; course: string; subject?: string; topic: string; url?: string; count?: number; ids: string[]; yt?: { title: string; url: string }[]; pdf?: { title: string; url: string }[] };
 export type Extras = {
   mcq?: { shuffleQ?: boolean; shuffleO?: boolean; showExp?: boolean; retake?: boolean; negMark?: boolean; perSession?: number; secPerQ?: number };
   ratta?: { shuffle?: boolean; selfCheck?: boolean; perSession?: number };

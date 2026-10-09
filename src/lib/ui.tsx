@@ -41,6 +41,7 @@ export const icons = {
   logout: <path d="M10 4H5v16h5M15 8l4 4-4 4M19 12H9" />,
   chart: <path d="M4 20V10M10 20V4M16 20v-8M22 20H2" />,
   flag: <path d="M5 21V4M5 4h11l-2 4 2 4H5" />,
+  shield: <><path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6z" /><path d="m9 12 2 2 4-4" /></>,
   menu: <path d="M4 6h16M4 12h16M4 18h16" />,
   list: <path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01" />,
   calendar: <><rect x="3" y="5" width="18" height="16" rx="2" /><path d="M3 10h18M8 3v4M16 3v4" /></>,

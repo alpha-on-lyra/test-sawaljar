@@ -1,0 +1,13 @@
+{
+  "routes": [
+    {
+      "routePath": "/api/ga",
+      "mountPath": "/api",
+      "method": "GET",
+      "module": [
+        "api/ga.ts:onRequestGet"
+      ]
+    }
+  ],
+  "baseURL": "/"
+}

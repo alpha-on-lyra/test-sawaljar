@@ -11,6 +11,7 @@ import GoogleAuthButton from '@/components/GoogleAuthButton';
 import { useTheme } from '@/lib/useTheme';
 import { useCloudSync } from '@/lib/useCloud';
 import TopStrip from '@/components/TopStrip';
+import AdblockNotice from '@/components/AdblockNotice';
 import { display, body, heading, tints, icons as uiIcons } from '@/lib/ui';
 
 
@@ -142,6 +143,7 @@ export default function Home() {
     <div className={`${wrap} flex flex-col`} style={themeStyle}>
       <style>{`.sj-float{animation:sj-float 3.2s ease-in-out infinite}@keyframes sj-float{50%{transform:translateY(-8px)}}@media (prefers-reduced-motion:reduce){.sj-float{animation:none}}`}</style>
 
+      <AdblockNotice />
       <TopStrip />
 
       {/* Header */}
@@ -353,6 +355,7 @@ export default function Home() {
             <ul className="space-y-2 text-sm text-[var(--mut)]">
               <li><a href={FEEDBACK_URL} target="_blank" rel="noopener noreferrer" className="hover:text-[var(--pri)] transition-colors">Send feedback</a></li>
               <li><a href={TRUSTPILOT_URL} target="_blank" rel="noopener noreferrer" className="hover:text-[var(--pri)] transition-colors">Review on Trustpilot</a></li>
+              <li><Link href="/privacy" className="hover:text-[var(--pri)] transition-colors">Privacy Policy</Link></li>
             </ul>
           </div>
         </div>

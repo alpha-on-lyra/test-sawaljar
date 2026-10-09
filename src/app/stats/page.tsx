@@ -76,15 +76,15 @@ export default function StatsPage() {
             </div>
             <div className="bg-[var(--card)] border border-[var(--line)] rounded-[var(--r)] p-5">
               <h2 className="font-bold" style={heading}>Last 7 days</h2>
-              <svg viewBox="0 0 280 130" className="w-full mt-3" role="img" aria-label="Attempts in the last 7 days">
+              <svg viewBox="0 0 280 150" overflow="visible" className="w-full mt-3" role="img" aria-label="Attempts in the last 7 days">
                 {days.map((d, i) => {
                   const a = s.byDay[d.k]?.a || 0;
-                  const h = (a / max) * 90;
+                  const h = a ? Math.max(8, (a / max) * 76) : 4;
                   return (
                     <g key={d.k}>
-                      <rect x={i * 40 + 8} y={100 - h} width="24" height={h} rx="6" fill="var(--pri)" opacity={a ? 1 : 0.15} />
-                      {a > 0 && <text x={i * 40 + 20} y={94 - h} textAnchor="middle" fontSize="10" fill="var(--ink)">{a}</text>}
-                      <text x={i * 40 + 20} y="120" textAnchor="middle" fontSize="10" fill="var(--mut)">{d.l}</text>
+                      <rect x={i * 40 + 8} y={112 - h} width="24" height={h} rx="6" fill="var(--pri)" opacity={a ? 1 : 0.15} />
+                      {a > 0 && <text x={i * 40 + 20} y={112 - h - 7} textAnchor="middle" fontSize="11" fontWeight="700" fill="var(--ink)">{a}</text>}
+                      <text x={i * 40 + 20} y="134" textAnchor="middle" fontSize="10" fill="var(--mut)">{d.l}</text>
                     </g>
                   );
                 })}

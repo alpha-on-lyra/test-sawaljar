@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import GoogleAuthButton from '@/components/GoogleAuthButton';
 import JarArt from '@/components/JarArt';
@@ -22,6 +23,7 @@ export default function LoginPage() {
           <h1 className="text-3xl sm:text-4xl font-bold tracking-tight leading-tight" style={heading}>Welcome to SawalJar</h1>
           <p className="mt-3 text-[var(--mut)] max-w-md">Sign in with Google to save your progress, keep your streak and see your statistics. No passwords to remember.</p>
           <div className="mt-8 max-w-sm"><GoogleAuthButton /></div>
+          <p className="mt-4 text-xs text-[var(--mut)] max-w-sm">By signing in, you accept our <Link href="/privacy" className="underline underline-offset-2 font-semibold hover:text-[var(--ink)]">Privacy Policy</Link>.</p>
           <ul className="mt-8 space-y-2 text-sm text-[var(--mut)]">
             {['Free MCQs and Ratta Cards', 'Your results stay saved', 'One tap to sign in'].map((t) => (
               <li key={t} className="flex items-center gap-2"><span className="text-[var(--pri)]"><Ic className="w-4 h-4">{icons.check}</Ic></span>{t}</li>

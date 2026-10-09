@@ -6,7 +6,9 @@ import { useTheme } from '@/lib/useTheme';
 import { StripBar, DEFAULT_STRIP } from '@/components/TopStrip';
 import { useCloudSync } from '@/lib/useCloud';
 import { getSupabase, isSupabaseConfigured } from '@/lib/supabase';
-import { syncFromCloud, pushAll, cloudDbUsage, cloudCleanup } from '@/lib/cloud';
+import { syncFromCloud, pushAll, cloudDbUsage, cloudCleanup, cloudQuestionStats } from '@/lib/cloud';
+import { loadMcqs, loadCards, qkey } from '@/lib/bank';
+import type { LinkSet } from '@/lib/bank';
 import type { Strip } from '@/components/TopStrip';
 
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
@@ -35,14 +37,14 @@ import {
 type BankOpts = { shuffleQ: boolean; shuffleO: boolean; showExp: boolean; retake: boolean; negMark: boolean; perSession: number; secPerQ: number };
 type RattaOpts = { shuffle: boolean; selfCheck: boolean; perSession: number };
 type Res = { title: string; url: string };
-type BankSet = { id: string; name: string; kind: 'upload' | 'link'; url?: string; course: string; subject?: string; topic: string; ids: string[]; yt: Res[]; pdf: Res[]; updated: number };
+type BankSet = { id: string; name: string; kind: 'upload' | 'link'; url?: string; course: string; subject?: string; topic: string; ids: string[]; count?: number; yt: Res[]; pdf: Res[]; updated: number };
 type Extras = { mcq: BankOpts; ratta: RattaOpts; mcqSets: BankSet[]; rattaSets: BankSet[]; stats?: Record<string, { views: number; attempts: number }>; monthly?: MonthlyTest[]; offline?: Record<string, boolean>; adSlots?: Record<string, AdSlot>; strip?: Strip };
 type AdSlot = { on: boolean; provider: 'adsense' | 'adsterra'; code: string; height: number };
 type BankKind = 'mcq' | 'ratta';
 type BankForm = { course: string; subject: string; newSubject: string; topic: string; newTopic: string; mode: 'upload' | 'link'; url: string; name: string; text: string; file: string };
 type Parsed = { items: Record<string, unknown>[]; yt: Res[]; pdf: Res[]; name?: string; skipped: number };
 const NEW_TOPIC = '__new';
-const EMPTY_FORM: BankForm = { course: '', subject: '', newSubject: '', topic: '', newTopic: '', mode: 'upload', url: '', name: '', text: '', file: '' };
+const EMPTY_FORM: BankForm = { course: '', subject: '', newSubject: '', topic: '', newTopic: '', mode: 'link', url: '', name: '', text: '', file: '' };
 const toRes = (v: unknown, label: string): Res[] => {
   const arr = Array.isArray(v) ? v : v ? [v] : [];
   return arr
@@ -126,7 +128,7 @@ function FilePick({ name, onFile }: { name?: string; onFile: (f: File) => void }
 
 function AdminApp() {
   const [state, setState] = useState<AppState>(seedInitialData());
-  const cloud = useCloudSync();
+  const cloud = useCloudSync(true);
   const [usage, setUsage] = useState<{ bytes: number; limit: number } | null>(null);
   useEffect(() => {
     const f = () => setState(loadAppState());
@@ -374,6 +376,30 @@ function AdminApp() {
   const topicsIn = (course: string, subject: string): string[] =>
     Array.from(new Set([...extras.mcqSets, ...extras.rattaSets].filter((x) => x.course === course && x.subject === subject).map((x) => x.topic))).filter(Boolean);
   const [bm, setBm] = useState<Record<BankKind, BankForm>>({ mcq: { ...EMPTY_FORM }, ratta: { ...EMPTY_FORM } });
+  const [qsOpen, setQsOpen] = useState<{ k: BankKind; s: BankSet } | null>(null);
+  const [qsRows, setQsRows] = useState<{ q: string; attempts: number; pct: number }[] | null>(null);
+  const [qsErr, setQsErr] = useState('');
+  const openQs = async (k: BankKind, s: BankSet) => {
+    setQsOpen({ k, s });
+    setQsRows(null);
+    setQsErr('');
+    try {
+      const own = s.url && !s.ids.length;
+      const [stats, items] = await Promise.all([
+        cloudQuestionStats(s.id),
+        own ? (k === 'mcq' ? loadMcqs(s as unknown as LinkSet) : loadCards(s as unknown as LinkSet)) : Promise.resolve((k === 'mcq' ? state.mcqs : state.ratta).filter((x) => s.ids.includes(x.id))),
+      ]);
+      const by = new Map(stats.map((r) => [r.qkey, r]));
+      const rows = (items as { q: string }[]).map((it) => {
+        const r = by.get(qkey(it.q));
+        return { q: it.q, attempts: r?.attempts || 0, pct: r && r.attempts ? Math.round((r.correct / r.attempts) * 100) : -1 };
+      });
+      rows.sort((a, b) => Number(a.attempts === 0) - Number(b.attempts === 0) || a.pct - b.pct);
+      setQsRows(rows);
+    } catch (e) {
+      setQsErr((e as Error).message || 'Could not load the statistics');
+    }
+  };
   const [bq, setBq] = useState('');
   const [bcf, setBcf] = useState('');
   const patchBm = (k: BankKind, p: Partial<BankForm>) => setBm((s) => ({ ...s, [k]: { ...s[k], ...p } }));
@@ -392,7 +418,8 @@ function AdminApp() {
     const ids: string[] = [];
     const mcqs: MCQ[] = [];
     const cards: RattaCard[] = [];
-    p.items.forEach((o) => {
+    // A linked file stays on your own website: only its name, count and links are saved, never the questions
+    (meta.kind === 'link' ? [] : p.items).forEach((o) => {
       const course = String(o.course || meta.course);
       const topic = String(o.topic || meta.topic);
       if (k === 'mcq') {
@@ -411,11 +438,11 @@ function AdminApp() {
       const old = (ex[key] || []) as BankSet[];
       const prevSet = old.find((s) => s.id === setId);
       const drop = new Set(prevSet?.ids || []);
-      const set: BankSet = { id: setId, name: meta.name, kind: meta.kind, url: meta.url, course: meta.course, subject: meta.subject || 'General', topic: meta.topic, ids, yt: p.yt, pdf: p.pdf, updated: Date.now() };
+      const set: BankSet = { id: setId, name: meta.name, kind: meta.kind, url: meta.url, course: meta.course, subject: meta.subject || 'General', topic: meta.topic, ids, count: p.items.length, yt: p.yt, pdf: p.pdf, updated: Date.now() };
       const sets = prevSet ? old.map((s) => (s.id === setId ? set : s)) : [set, ...old];
       const next = { ...prev, extras: { ...ex, [key]: sets } } as AppState;
       return k === 'mcq' ? { ...next, mcqs: [...mcqs, ...prev.mcqs.filter((m) => !drop.has(m.id))] } : { ...next, ratta: [...cards, ...prev.ratta.filter((c) => !drop.has(c.id))] };
-    }, `${replaceId ? 'Updated' : 'Imported'} ${k === 'mcq' ? 'MCQ' : 'Ratta'} file "${meta.name}" (${ids.length} items)`);
+    }, `${replaceId ? 'Updated' : 'Imported'} ${k === 'mcq' ? 'MCQ' : 'Ratta'} file "${meta.name}" (${p.items.length} items)`);
   };
 
   const fetchBank = async (url: string): Promise<string | null> => {
@@ -449,7 +476,7 @@ function AdminApp() {
     if (typeof p === 'string') return showToast(p);
     commitSet(k, p, { name: f.name.trim() || p.name || (f.mode === 'link' ? fileLabel(url) : f.file.replace(/\.json$/i, '')) || 'Untitled', kind: f.mode, url, course, subject, topic });
     patchBm(k, { text: '', file: '', url: '', name: '', newTopic: '', newSubject: '' });
-    showToast(`Imported ${p.items.length} items${p.skipped ? `, ${p.skipped} skipped` : ''}`);
+    showToast(`Linked ${p.items.length} items${p.skipped ? `, ${p.skipped} skipped` : ''}`);
   };
 
   const refreshSet = async (k: BankKind, s: BankSet) => {
@@ -462,7 +489,7 @@ function AdminApp() {
   };
 
   const deleteSet = (k: BankKind, s: BankSet) => {
-    if (!confirm(`Delete "${s.name}" and its ${s.ids.length} items?`)) return;
+    if (!confirm(`Delete "${s.name}" and its ${s.count ?? s.ids.length} items?`)) return;
     const drop = new Set(s.ids);
     const key = k === 'mcq' ? 'mcqSets' : 'rattaSets';
     updateStateAndSave((prev) => {
@@ -543,7 +570,7 @@ function AdminApp() {
       <div className="flex flex-col gap-4">
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
           <div className="stat"><span>JSON files</span><b>{sets.length}</b></div>
-          <div className="stat"><span>Total {noun}</span><b>{sets.reduce((n, x) => n + x.ids.length, 0)}</b></div>
+          <div className="stat"><span>Total {noun}</span><b>{sets.reduce((n, x) => n + (x.count ?? x.ids.length), 0)}</b></div>
           <div className="stat"><span>Attempts</span><b>{sets.reduce((n, x) => n + st(x.id).attempts, 0)}</b></div>
         </div>
 
@@ -583,10 +610,7 @@ function AdminApp() {
               </div>
             )}
           </div>
-          <div className="flex gap-2 mb-3">
-            <button type="button" className={`b ${f.mode === 'upload' ? 'p' : ''}`} onClick={() => patchBm(k, { mode: 'upload' })}>Upload file</button>
-            <button type="button" className={`b ${f.mode === 'link' ? 'p' : ''}`} onClick={() => patchBm(k, { mode: 'link' })}>Paste link</button>
-          </div>
+          <p className="sub mb-3">Questions stay on your own website. Paste the link to a JSON file: students open it when they press Solve, and Supabase keeps only the file name, count and statistics. The host must allow cross-origin access (CORS).</p>
           <div className="row">
             {f.mode === 'upload' ? (
               <FilePick
@@ -633,11 +657,12 @@ function AdminApp() {
                       <small>{s.kind === 'link' ? 'External link' : 'Uploaded file'}</small>
                     </td>
                     <td>{s.course}<small>{s.subject || 'No subject: use Edit to set one'} › {s.topic}</small></td>
-                    <td>{s.ids.length}</td>
+                    <td>{s.count ?? s.ids.length}</td>
                     <td className="text-xs">{s.yt.length} video, {s.pdf.length} PDF</td>
                     <td>{st(s.id).attempts}<small>{st(s.id).views} views</small></td>
                     <td className="text-xs text-[var(--mut)]">{timeAgo(s.updated)}</td>
                     <td className="whitespace-nowrap">
+                      <button type="button" className="b" onClick={() => void openQs(k, s)}>Question stats</button>
                       <button type="button" className="b" onClick={() => editSet(k, s)}>Edit</button>
                       {s.kind === 'link' && (<button type="button" className="b" onClick={() => void refreshSet(k, s)}>Refresh</button>)}
                       <button type="button" className="b d" onClick={() => deleteSet(k, s)}>Delete</button>
@@ -648,6 +673,26 @@ function AdminApp() {
             </table>
           </div>
         </div>
+        {qsOpen && qsOpen.k === k && (
+          <div className="card">
+            <div className="row">
+              <h3 style={{ flex: 1, margin: 0 }}>Question statistics: {qsOpen.s.name}</h3>
+              <button type="button" className="b" onClick={() => setQsOpen(null)}>Close</button>
+            </div>
+            {qsErr ? <p className="sub" style={{ color: 'var(--red, #c0392b)' }}>{qsErr}</p> : !qsRows ? <p className="sub">Loading...</p> : (
+              <div className="tw">
+                <table>
+                  <thead><tr><th>Question</th><th>Answers</th><th>Correct</th></tr></thead>
+                  <tbody>
+                    {qsRows.slice(0, 100).map((r, i) => (<tr key={i}><td>{r.q}</td><td>{r.attempts}</td><td>{r.pct < 0 ? 'No answers yet' : `${r.pct}%`}</td></tr>))}
+                    {!qsRows.length && <tr><td colSpan={3}>No questions found in this file.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <p className="sub mt-2">Hardest questions first. Statistics come from Supabase; the question text is read from your file.</p>
+          </div>
+        )}
         {k === 'mcq' ? renderMcqOptions() : renderRattaOptions()}
       </div>
     );
@@ -1177,7 +1222,7 @@ function AdminApp() {
     const m: Record<string, number> = {};
     extras.mcqSets.filter((s) => s.course === course).forEach((s) => {
       if (!s.subject) return;
-      m[s.subject] = (m[s.subject] || 0) + s.ids.length;
+      m[s.subject] = (m[s.subject] || 0) + (s.count ?? s.ids.length);
     });
     return m;
   };
@@ -1310,10 +1355,18 @@ function AdminApp() {
   const slotOf = (key: string, h: number): AdSlot => ({ on: false, provider: 'adsense', code: '', height: h, ...(extras.adSlots?.[key] || {}) });
   const setSlot = (key: string, h: number, patch: Partial<AdSlot>) => patchEx({ adSlots: { ...(extras.adSlots || {}), [key]: { ...slotOf(key, h), ...patch } } }, `Updated ad slot ${key}`);
 
+  const adblock = ((state.site as unknown as { adblock?: { on: boolean; strict: boolean } }).adblock) || { on: false, strict: false };
+  const setAdblock = (patch: Partial<{ on: boolean; strict: boolean }>) =>
+    updateStateAndSave((prev) => ({ ...prev, site: { ...prev.site, adblock: { ...(((prev.site as unknown as { adblock?: { on: boolean; strict: boolean } }).adblock) || { on: false, strict: false }), ...patch } } } as AppState), 'Updated the ad blocker message');
+
   const renderAds = () => (
     <div className="flex flex-col gap-4">
       <div className="card">
-        {tg('Show ads to students', 'Master switch. When off, every ad area disappears from the student pages', state.ads.on, (v) => updateStateAndSave((prev) => ({ ...prev, ads: { ...prev.ads, on: v } }), `Ads ${v ? 'enabled' : 'disabled'}`))}
+        {tg('Show ads to students', 'Master switch. When off, every ad area disappears from the student pages (and the ad blocker message is switched off too)', state.ads.on, (v) =>
+          updateStateAndSave((prev) => ({ ...prev, ads: { ...prev.ads, on: v }, ...(v ? {} : { site: { ...prev.site, adblock: { ...(((prev.site as unknown as { adblock?: { on: boolean; strict: boolean } }).adblock) || { on: false, strict: false }), on: false } } }) } as AppState), `Ads ${v ? 'enabled' : 'disabled'}`)
+        )}
+        {tg('Ask visitors to turn off their ad blocker', 'Shows a message with your picture (public/adblock.svg) when a blocker is detected. Works on every page except the Privacy Policy and admin. Only use it while ads are on.', !!adblock.on, (v) => setAdblock({ on: v && state.ads.on }))}
+        {tg('Do not let visitors close the message', 'Strict mode: they must turn the blocker off to continue. Detection is not perfect, so a few visitors may be stopped by mistake.', !!adblock.strict, (v) => setAdblock({ strict: v }))}
         <details className="mt-2">
           <summary className="text-sm font-bold cursor-pointer">How to paste your ad code</summary>
           <ul className="sub list-disc pl-5 mt-2 space-y-1">

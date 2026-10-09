@@ -9,11 +9,10 @@ import { loadAppState, seedInitialData, getActiveCourse, setActiveCourse } from 
 import { AppState } from '@/lib/types';
 import { availableFor, MonthlyTest } from '@/lib/monthly';
 import { trackTopicView } from '@/lib/analytics';
-import { cloudTouch } from '@/lib/cloud';
 import { Ic, icons, heading, tints, focus } from '@/lib/ui';
 
 type Res = { title: string; url: string };
-type BankSet = { id: string; name: string; course: string; subject?: string; topic: string; ids: string[]; yt: Res[]; pdf: Res[] };
+type BankSet = { id: string; name: string; course: string; subject?: string; topic: string; ids: string[]; count?: number; yt: Res[]; pdf: Res[] };
 type Extras = { mcqSets?: BankSet[]; rattaSets?: BankSet[]; monthly?: MonthlyTest[]; offline?: Record<string, boolean> };
 type Ann = { id: string; t: string; m: string; k: string; d?: number };
 type NavItem = { href: string; label: string; icon: React.ReactNode; badge?: number };
@@ -88,10 +87,6 @@ export default function Dashboard() {
   const ex = ((st as unknown as { extras?: Extras } | null)?.extras || {}) as Extras;
   const offline = !!(course && ex.offline?.[course.id]);
 
-  useEffect(() => {
-    if (cname) void cloudTouch(cname).catch(() => undefined);
-  }, [cname]);
-
   const shell = (inner: React.ReactNode) => <StudentShell requireAuth sidebarToggle>{inner}</StudentShell>;
   if (!st) return shell(null);
   const flag = (k: string) => (st.flags as unknown as Record<string, boolean> | undefined)?.[k] !== false;
@@ -164,7 +159,7 @@ export default function Dashboard() {
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <div className="font-bold truncate" style={heading}>{s.name}</div>
-            <div className="text-xs text-[var(--mut)]">{s.ids.length} {kind === 'practice' ? 'MCQs' : 'Ratta Cards'}</div>
+            <div className="text-xs text-[var(--mut)]">{s.count ?? s.ids.length} {kind === 'practice' ? 'MCQs' : 'Ratta Cards'}</div>
           </div>
           <Link href={href} className={`shrink-0 inline-flex items-center gap-1.5 px-4 py-2 rounded-full bg-[var(--pri)] text-[var(--bg)] text-sm font-semibold hover:opacity-90 ${focus}`}>
             {kind === 'practice' ? 'Solve' : 'Revise'}<Ic className="w-4 h-4">{icons.arrow}</Ic>
@@ -241,7 +236,7 @@ export default function Dashboard() {
                 </Link>
               )}
               <div className="grid grid-cols-3 gap-3">
-                {([['Subjects', subjects.length], ['Topics', topicCount], ['MCQs', mcqs.length]] as [string, number][]).map(([l, v]) => (
+                {([['Subjects', subjects.length], ['Topics', topicCount], ['MCQs', mSets.reduce((n, s) => n + (s.count ?? s.ids.length), 0)]] as [string, number][]).map(([l, v]) => (
                   <div key={l} className="bg-[var(--card)] border border-[var(--line)] rounded-[var(--r)] p-4 text-center">
                     <div className="text-2xl font-bold" style={heading}>{v}</div>
                     <div className="text-xs text-[var(--mut)]">{l}</div>

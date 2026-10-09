@@ -7,13 +7,14 @@ import StudentShell from '@/components/StudentShell';
 import { AdBanner } from '@/components/AdBanner';
 import { ReportModal } from '@/components/ReportModal';
 import { loadAppState, saveAppState, uid } from '@/lib/store';
-import { submitReportToSupabase, logAntiCheatToSupabase } from '@/lib/supabase';
+import { submitReportToSupabase } from '@/lib/supabase';
 import { AppState, MCQ } from '@/lib/types';
-import { availableFor, buildMonthly } from '@/lib/monthly';
+import { availableFor } from '@/lib/monthly';
+import { loadMcqs, buildMonthlyAsync, isLinkSet, qkey } from '@/lib/bank';
+import { AnswerBatcher, recoverPending } from '@/lib/batch';
 import { extrasOf, mcqOpts, shuffle, isHidden } from '@/lib/study';
 import { recordAttempt, getStats, streak } from '@/lib/userStats';
 import { recordSolve } from '@/lib/accounts';
-import { bumpItemStat } from '@/lib/setStats';
 import { useUser, displayName } from '@/lib/useUser';
 import { Ic, icons, heading, focus } from '@/lib/ui';
 
@@ -38,6 +39,11 @@ function PracticeInner() {
   const [left, setLeft] = useState(0);
   const [reportQ, setReportQ] = useState<MCQ | null>(null);
   const [warn, setWarn] = useState('');
+  const [remote, setRemote] = useState<MCQ[] | null>(null);
+  const [loadErr, setLoadErr] = useState('');
+  // Nothing is sent to Supabase while the student solves. Answers wait here and go in ONE request when the test is finished.
+  const batch = useRef<AnswerBatcher | null>(null);
+  const getBatch = () => (batch.current ??= new AnswerBatcher('mcq', course));
   const [ended, setEnded] = useState('');
   const switches = useRef(0);
 
@@ -52,22 +58,42 @@ function PracticeInner() {
   const opts = st ? mcqOpts(st) : null;
   const test = (ex.monthly || []).find((t) => t.id === monthlyId && t.live !== false);
   const set = (ex.mcqSets || []).find((s) => s.id === setId);
+  const link = isLinkSet(set);
+  // The file is opened from its link only now, because the student pressed Solve
+  useEffect(() => {
+    if (!set || !link) return;
+    let on = true;
+    setRemote(null);
+    setLoadErr('');
+    loadMcqs(set).then((x) => on && setRemote(x)).catch((e: Error) => on && setLoadErr(e.message || 'Could not load the questions'));
+    return () => {
+      on = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setId, link, set?.url]);
   const subjMap = useMemo(() => {
     const m: Record<string, string> = {};
     (extrasOf(st || ({} as AppState)).mcqSets || []).forEach((s) => s.ids.forEach((id) => s.subject && (m[id] = s.subject)));
     return m;
   }, [st]);
 
+  const setOfItem = useMemo(() => {
+    const m: Record<string, string> = {};
+    (extrasOf(st || ({} as AppState)).mcqSets || []).forEach((s) => s.ids.forEach((id) => (m[id] = s.id)));
+    return m;
+  }, [st]);
+
   const pool = useCallback((): MCQ[] => {
     if (!st) return [];
     const ok = (m: MCQ) => !isHidden(m);
-    if (monthlyId) return test ? buildMonthly(st, test).filter(ok) : [];
+    if (monthlyId) return [];
     if (setId) {
+      if (link) return (remote || []).filter(ok);
       const ids = new Set(set?.ids || []);
       return st.mcqs.filter((m) => ids.has(m.id) && ok(m));
     }
     return []; // tests only start from a topic file or a monthly test
-  }, [st, monthlyId, test, setId, set, course, topic]);
+  }, [st, monthlyId, setId, set, link, remote]);
 
   const total = !st ? 0 : monthlyId ? (test ? test.parts.reduce((n, p) => n + Math.min(p.count, availableFor(st, test.course, p.subject)), 0) : 0) : pool().length;
   const title = monthlyId ? test?.name || 'Monthly test' : set?.name || topic || course || 'Practice';
@@ -79,13 +105,14 @@ function PracticeInner() {
 
   const finish = useCallback((why = '') => {
     setEnded(why);
+    void getBatch().flush();
     setPhase('done');
     if (document.fullscreenElement) void document.exitFullscreen?.();
   }, []);
 
-  const start = () => {
+  const start = async () => {
     if (!st || !opts) return;
-    let items = pool();
+    let items = test ? (await buildMonthlyAsync(st, test)).filter((m) => !isHidden(m)) : pool();
     if (opts.shuffleQ && !test) items = shuffle(items);
     items = test ? items : items.slice(0, opts.perSession || items.length);
     if (!items.length) return;
@@ -97,6 +124,7 @@ function PracticeInner() {
     switches.current = 0;
     setLeft(timedTotal ? (test?.minutes || 0) * 60 : opts.secPerQ);
     setPhase('run');
+    if (setId) getBatch().view(setId);
     if (exam && ac?.enabled && ac.enforceFullscreen) void document.documentElement.requestFullscreen?.().catch(() => undefined);
   };
 
@@ -109,12 +137,26 @@ function PracticeInner() {
     if (!q || picked[q.m.id] !== undefined) return;
     const ok = di >= 0 && q.order[di] === q.m.a;
     setPicked((p) => ({ ...p, [q.m.id]: di }));
-    recordAttempt(uidStr, ok, subjMap[q.m.id] || 'General');
-    bumpItemStat(q.m.id, 'attempts');
+    const subject = (q.m as unknown as { subject?: string }).subject || subjMap[q.m.id] || 'General';
+    recordAttempt(uidStr, ok, subject);
+    const sid = q.m.id.includes(':') ? q.m.id.split(':')[0] : setOfItem[q.m.id] || '';
+    if (sid) getBatch().add({ s: sid, j: subject, k: qkey(q.m.q), ok }); // kept here until the test is finished
     recordSolve(user?.email, ok, streak(getStats(uidStr)));
-  }, [qs, i, picked, uidStr, user, subjMap]);
+  }, [qs, i, picked, uidStr, user, subjMap, setOfItem]);
 
   const next = () => (i < qs.length - 1 ? setI(i + 1) : finish());
+
+  // Leaving the page mid-test: whatever is left is sent once, after leaving (never while solving)
+  useEffect(
+    () => () => {
+      const b = batch.current;
+      if (b) {
+        b.release();
+        void recoverPending();
+      }
+    },
+    []
+  );
 
   // timers
   useEffect(() => {
@@ -131,10 +173,6 @@ function PracticeInner() {
     if (timedTotal) finish('Time is up');
     else if (timedEach && !answered) answer(-1);
   }, [left, phase, timedTotal, timedEach, answered, answer, finish]);
-  useEffect(() => {
-    if (phase === 'run' && cur) bumpItemStat(cur.m.id, 'views');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [i, phase]);
 
   // light anti-cheat for exams (monthly tests and timed sessions), driven by the admin Security settings
   useEffect(() => {
@@ -143,7 +181,7 @@ function PracticeInner() {
       const c = loadAppState();
       const entry = { id: uid('ac'), userEmail: user?.email, eventType, testTitle: title, t: Date.now() };
       saveAppState({ ...c, antiCheatLogs: [entry, ...c.antiCheatLogs].slice(0, 300) } as AppState);
-      void logAntiCheatToSupabase({ eventType, testTitle: title, userEmail: user?.email });
+      getBatch().log(eventType, title); // sent with the final request
     };
     const vis = () => {
       if (!document.hidden) return;
@@ -223,6 +261,8 @@ function PracticeInner() {
               <p className="mt-6 text-[var(--mut)]">Open a test from a topic on your dashboard to start.</p>
             ) : monthlyId && !test ? (
               <p className="mt-6 text-[var(--mut)]">This monthly test is not available right now.</p>
+            ) : link && !remote ? (
+              <p className="mt-6 text-[var(--mut)]">{loadErr || 'Loading questions...'}</p>
             ) : count === 0 ? (
               <p className="mt-6 text-[var(--mut)]">There are no questions here yet. Please check back soon.</p>
             ) : (

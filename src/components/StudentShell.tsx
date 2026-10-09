@@ -11,6 +11,7 @@ import { useUser, displayName } from '@/lib/useUser';
 import { useTheme } from '@/lib/useTheme';
 import { useCloudSync } from '@/lib/useCloud';
 import TopStrip from '@/components/TopStrip';
+import AdblockNotice from '@/components/AdblockNotice';
 import { syncAccount, getAccountStatus, Status } from '@/lib/accounts';
 import { display, body, heading, Ic, icons, focus } from '@/lib/ui';
 
@@ -69,6 +70,7 @@ export default function StudentShell({ children, backHref = '/', backLabel = 'Ho
 
   return (
     <div className={`${display.variable} ${body.variable} min-h-screen overflow-x-clip bg-[var(--bg)] text-[var(--ink)] selection:bg-[var(--pri2)]`} style={style}>
+      <AdblockNotice />
       <TopStrip />
       <header className="sticky top-0 z-30 glass" style={{ paddingTop: 'env(safe-area-inset-top, 0px)' }}>
         <div className="max-w-7xl mx-auto px-3 sm:px-6 h-16 sm:h-20 grid grid-cols-[1fr_auto_1fr] items-center gap-2">
@@ -102,6 +104,7 @@ export default function StudentShell({ children, backHref = '/', backLabel = 'Ho
                     {!blocked && <Link role="menuitem" href="/stats" className={item}><Ic>{icons.chart}</Ic>Statistics</Link>}
                     {!blocked && <Link role="menuitem" href="/announcements" className={item}><Ic>{icons.bell}</Ic>Announcements</Link>}
                     {!blocked && user.role === 'admin' && <Link role="menuitem" href="/admin" className={item}><Ic>{icons.wrench}</Ic>Admin panel</Link>}
+                    <Link role="menuitem" href="/privacy" className={item}><Ic>{icons.shield}</Ic>Privacy Policy</Link>
                     <button role="menuitem" type="button" onClick={toggle} className={item}><Ic>{dark ? icons.sun : icons.moon}</Ic>{dark ? 'Light mode' : 'Dark mode'}</button>
                     <button role="menuitem" type="button" onClick={() => void logout()} className={`${item} text-[var(--red,#c0392b)]`}><Ic>{icons.logout}</Ic>Log out</button>
                   </div>

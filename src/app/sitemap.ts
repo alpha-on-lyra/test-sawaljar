@@ -5,5 +5,8 @@ const SITE = process.env.NEXT_PUBLIC_SITE_URL || 'https://sawaljar.pages.dev';
 
 // Only public pages belong here. Student pages need a sign-in, so search engines cannot see them.
 export default function sitemap(): MetadataRoute.Sitemap {
-  return [{ url: SITE, lastModified: new Date(), changeFrequency: 'weekly', priority: 1 }];
+  return [
+    { url: SITE, lastModified: new Date(), changeFrequency: 'weekly', priority: 1 },
+    { url: `${SITE}/privacy`, lastModified: new Date(), changeFrequency: 'yearly', priority: 0.3 },
+  ];
 }

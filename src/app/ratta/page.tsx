@@ -1,6 +1,6 @@
 'use client';
 
-import React, { Suspense, useEffect, useState } from 'react';
+import React, { Suspense, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import StudentShell from '@/components/StudentShell';
@@ -10,7 +10,8 @@ import { loadAppState, saveAppState, uid } from '@/lib/store';
 import { submitReportToSupabase } from '@/lib/supabase';
 import { AppState, RattaCard } from '@/lib/types';
 import { extrasOf, rattaOpts, shuffle, isHidden } from '@/lib/study';
-import { bumpItemStat } from '@/lib/setStats';
+import { loadCards, isLinkSet, qkey } from '@/lib/bank';
+import { AnswerBatcher, recoverPending } from '@/lib/batch';
 import { useUser, displayName } from '@/lib/useUser';
 import { Ic, icons, heading, focus } from '@/lib/ui';
 
@@ -30,6 +31,11 @@ function RattaInner() {
   const [shown, setShown] = useState(false);
   const [known, setKnown] = useState<Record<string, boolean>>({});
   const [reportCard, setReportCard] = useState<RattaCard | null>(null);
+  const [remote, setRemote] = useState<RattaCard[] | null>(null);
+  const [loadErr, setLoadErr] = useState('');
+  // Nothing is sent to Supabase while the student revises. Results go in ONE request when the session ends.
+  const batch = useRef<AnswerBatcher | null>(null);
+  const getBatch = () => (batch.current ??= new AnswerBatcher('ratta', course));
 
   useEffect(() => {
     const load = () => setSt(loadAppState());
@@ -40,9 +46,24 @@ function RattaInner() {
 
   const opts = st ? rattaOpts(st) : null;
   const set = st ? (extrasOf(st).rattaSets || []).find((s) => s.id === setId) : undefined;
+  const link = isLinkSet(set);
+  // The file is opened from its link only now, because the student pressed Revise
+  useEffect(() => {
+    if (!set || !link) return;
+    let on = true;
+    setRemote(null);
+    setLoadErr('');
+    loadCards(set).then((x) => on && setRemote(x)).catch((e: Error) => on && setLoadErr(e.message || 'Could not load the cards'));
+    return () => {
+      on = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setId, link, set?.url]);
+
   const pool = (): RattaCard[] => {
     if (!st) return [];
     if (setId) {
+      if (link) return (remote || []).filter((c) => !isHidden(c));
       const ids = new Set(set?.ids || []);
       return st.ratta.filter((c) => ids.has(c.id) && !isHidden(c));
     }
@@ -59,6 +80,7 @@ function RattaInner() {
     setShown(false);
     setKnown({});
     setPhase('run');
+    if (setId) getBatch().view(setId);
   };
   const start = () => begin((opts?.shuffle ? shuffle(pool()) : pool()).slice(0, opts?.perSession || undefined));
 
@@ -68,24 +90,38 @@ function RattaInner() {
   const mastered = Object.values(known).filter(Boolean).length;
   const missed = deck.filter((c) => known[c.id] === false);
 
-  useEffect(() => {
-    if (phase === 'run' && card) bumpItemStat(card.id, 'views');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [i, phase]);
+  const record = (c: RattaCard, ok: boolean) => {
+    const sid = c.id.includes(':') ? c.id.split(':')[0] : setId;
+    if (sid) getBatch().add({ s: sid, j: set?.subject || 'General', k: qkey(c.q), ok }); // kept here until the session ends
+  };
+  // Leaving the page mid-session: whatever is left is sent once, after leaving (never while revising)
+  useEffect(
+    () => () => {
+      const b = batch.current;
+      if (b) {
+        b.release();
+        void recoverPending();
+      }
+    },
+    []
+  );
 
   const advance = () => {
     setShown(false);
     if (i < deck.length - 1) setI(i + 1);
-    else setPhase('done');
+    else {
+      void getBatch().flush();
+      setPhase('done');
+    }
   };
   const reveal = () => {
     setShown(true);
-    if (card && !opts?.selfCheck) bumpItemStat(card.id, 'attempts');
+    if (card && !opts?.selfCheck) record(card, true);
   };
   const mark = (knew: boolean) => {
     if (!card) return;
     setKnown((k) => ({ ...k, [card.id]: knew }));
-    bumpItemStat(card.id, 'attempts');
+    record(card, knew);
     advance();
   };
 
@@ -130,7 +166,7 @@ function RattaInner() {
             {set && <p className="text-sm text-[var(--mut)] mt-1">{set.subject ? `${set.subject} › ` : ''}{set.topic}</p>}
             <p className="mt-3 text-[var(--mut)] max-w-sm mx-auto">Read the card, say the missing word in your head, then tap Show answer.</p>
             <div className="mt-4 flex flex-wrap justify-center gap-2"><span className="badge">{count} cards</span>{opts?.shuffle && <span className="badge">Shuffled</span>}</div>
-            {!setId ? <p className="mt-6 text-[var(--mut)]">Open a card file from a topic on your dashboard to start.</p> : count === 0 ? <p className="mt-6 text-[var(--mut)]">There are no cards here yet. Please check back soon.</p> : <button type="button" onClick={start} className={`${btnP} mt-6`}>Start revising<Ic className="w-4 h-4">{icons.arrow}</Ic></button>}
+            {!setId ? <p className="mt-6 text-[var(--mut)]">Open a card file from a topic on your dashboard to start.</p> : link && !remote ? <p className="mt-6 text-[var(--mut)]">{loadErr || 'Loading cards...'}</p> : count === 0 ? <p className="mt-6 text-[var(--mut)]">There are no cards here yet. Please check back soon.</p> : <button type="button" onClick={start} className={`${btnP} mt-6`}>Start revising<Ic className="w-4 h-4">{icons.arrow}</Ic></button>}
             <div className="mt-4"><Link href="/dashboard" className="text-sm font-semibold text-[var(--mut)] hover:text-[var(--ink)]">Back to dashboard</Link></div>
           </div>
         ) : phase === 'run' && card ? (
@@ -182,7 +218,10 @@ function RattaInner() {
             </div>
             <div className="flex items-center justify-between text-xs text-[var(--mut)] px-1">
               <span>Knew: <b className="text-[var(--ok)]">{mastered}</b> · Review: <b className="text-[var(--bad)]">{doneCount - mastered}</b></span>
-              <button type="button" onClick={() => setPhase('done')} className="font-semibold hover:text-[var(--ink)]">End session</button>
+              <button type="button" onClick={() => {
+                void getBatch().flush();
+                setPhase('done');
+              }} className="font-semibold hover:text-[var(--ink)]">End session</button>
             </div>
             {i > 0 && <button type="button" onClick={() => { setI(i - 1); setShown(false); }} className={`${btnS} self-start`}><Ic className="w-4 h-4">{icons.left}</Ic>Previous card</button>}
           </div>

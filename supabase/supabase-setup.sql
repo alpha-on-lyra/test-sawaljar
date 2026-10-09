@@ -117,6 +117,15 @@ create table if not exists public.user_subject_stats (
   correct integer not null default 0,
   primary key (user_id, subject)
 );
+-- Per-question results, so you can see which questions students get wrong. The questions themselves are NOT stored here:
+-- the JSON files live on another website and are opened by link. qkey is a short code of the question text.
+create table if not exists public.question_stats (
+  set_id text not null check (char_length(set_id) between 1 and 80),
+  qkey text not null check (char_length(qkey) between 1 and 40),
+  attempts integer not null default 0,
+  correct integer not null default 0,
+  primary key (set_id, qkey)
+);
 create table if not exists public.set_stats (
   set_id text primary key,
   views integer not null default 0,
@@ -189,6 +198,103 @@ begin
       set attempted = public.user_subject_stats.attempted + 1, correct = public.user_subject_stats.correct + ok;
 end $$;
 
+-- ONE call when a student FINISHES a test. While they solve, nothing is sent to Supabase.
+-- p_items = [{"s": "<file id>", "j": "<subject>", "k": "<question key>", "ok": true}, ...]
+-- p_views = the file ids that were opened. p_logs = anti-cheat events collected during the test.
+-- p_profile = true for MCQs (counts toward Statistics and the leaderboard), false for Ratta Cards.
+drop function if exists public.record_batch(text, text, boolean, jsonb);
+create or replace function public.record_batch(p_profile boolean, p_items jsonb, p_views text[] default '{}', p_course text default null, p_logs jsonb default '[]'::jsonb) returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  me uuid := auth.uid();
+  today date := (now() at time zone 'Asia/Karachi')::date;
+  it jsonb; ev jsonb; sid text; k text; subj text; v text; em text; good boolean;
+  n int := 0; ok_n int := 0; total int; used int; prev date; prof boolean; cnt int := 0;
+begin
+  if me is null or not public.is_active() then return; end if;
+  if p_views is not null then
+    foreach v in array p_views loop
+      cnt := cnt + 1;
+      exit when cnt > 20;
+      continue when char_length(coalesce(v, '')) not between 1 and 80;
+      insert into public.set_stats (set_id, views, attempts) values (v, 1, 0)
+        on conflict (set_id) do update set views = public.set_stats.views + 1;
+    end loop;
+  end if;
+  if p_logs is not null and jsonb_typeof(p_logs) = 'array' then
+    select email into em from public.profiles where id = me;
+    for ev in select value from jsonb_array_elements(p_logs) limit 20 loop
+      insert into public.anti_cheat_logs (user_id, user_email, event_type, test_title)
+        values (me, coalesce(em, ''), left(coalesce(ev ->> 'e', 'event'), 60), left(coalesce(ev ->> 't', 'Practice Session'), 120));
+    end loop;
+  end if;
+  if p_items is null or jsonb_typeof(p_items) <> 'array' then return; end if;
+  total := least(jsonb_array_length(p_items), 300);
+  if total = 0 then return; end if;
+  prof := coalesce(p_profile, false);
+  if prof then -- at most 2000 answers a day count, so nobody can inflate the leaderboard
+    select attempted into used from public.user_daily_stats where user_id = me and day = today;
+    if coalesce(used, 0) + total > 2000 then prof := false; end if;
+  end if;
+  for it in select value from jsonb_array_elements(p_items) limit 300 loop
+    sid := left(coalesce(it ->> 's', ''), 80);
+    k := left(coalesce(it ->> 'k', ''), 40);
+    continue when sid = '' or k = '';
+    subj := coalesce(nullif(left(trim(coalesce(it ->> 'j', '')), 80), ''), 'General');
+    good := (it ->> 'ok') = 'true';
+    n := n + 1;
+    ok_n := ok_n + case when good then 1 else 0 end;
+    insert into public.question_stats (set_id, qkey, attempts, correct) values (sid, k, 1, case when good then 1 else 0 end)
+      on conflict (set_id, qkey) do update
+        set attempts = public.question_stats.attempts + 1, correct = public.question_stats.correct + excluded.correct;
+    insert into public.set_stats (set_id, views, attempts) values (sid, 0, 1)
+      on conflict (set_id) do update set attempts = public.set_stats.attempts + 1;
+    if prof then
+      insert into public.user_subject_stats (user_id, subject, attempted, correct) values (me, subj, 1, case when good then 1 else 0 end)
+        on conflict (user_id, subject) do update
+          set attempted = public.user_subject_stats.attempted + 1, correct = public.user_subject_stats.correct + excluded.correct;
+    end if;
+  end loop;
+  if n = 0 or not prof then return; end if;
+  select last_active_day into prev from public.profiles where id = me;
+  update public.profiles
+     set solved = solved + n,
+         correct = correct + ok_n,
+         accuracy = round(100.0 * (correct + ok_n) / (solved + n)),
+         streak = case when prev = today then streak when prev = today - 1 then streak + 1 else 1 end,
+         enrolled_course = coalesce(nullif(left(p_course, 80), ''), enrolled_course),
+         last_active_day = today, last_seen = now(), updated_at = now()
+   where id = me;
+  insert into public.user_daily_stats (user_id, day, attempted, correct) values (me, today, n, ok_n)
+    on conflict (user_id, day) do update
+      set attempted = public.user_daily_stats.attempted + n, correct = public.user_daily_stats.correct + ok_n;
+end $$;
+
+-- ONE call when the app opens: who is signed in (role, ban status), whether the admin password step is done,
+-- and the version list of the shared content. Replaces three separate requests.
+create or replace function public.bootstrap() returns jsonb
+language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'profile', (select jsonb_build_object('id', p.id, 'email', p.email, 'name', p.name, 'avatar_url', p.avatar_url, 'role', p.role, 'status', p.status)
+                  from public.profiles p where p.id = auth.uid()),
+    'unlocked', public.is_admin(),
+    'versions', coalesce((select jsonb_agg(jsonb_build_object('key', c.key, 'updated_at', c.updated_at))
+                            from public.content c
+                           where c.key in ('courses', 'site', 'maint', 'strip', 'ann') or public.is_active()), '[]'::jsonb));
+$$;
+
+-- ONE call for the Statistics page
+create or replace function public.my_stats() returns jsonb
+language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'solved', coalesce((select solved from public.profiles where id = auth.uid()), 0),
+    'correct', coalesce((select correct from public.profiles where id = auth.uid()), 0),
+    'days', coalesce((select jsonb_agg(jsonb_build_object('day', day, 'a', attempted, 'c', correct)) from public.user_daily_stats
+                       where user_id = auth.uid() and day >= (now() at time zone 'Asia/Karachi')::date - 60), '[]'::jsonb),
+    'subjects', coalesce((select jsonb_agg(jsonb_build_object('s', subject, 'a', attempted, 'c', correct)) from public.user_subject_stats
+                           where user_id = auth.uid()), '[]'::jsonb));
+$$;
+
 create or replace function public.bump_set_stat(p_set text, p_field text) returns void
 language plpgsql security definer set search_path = public as $$
 begin
@@ -211,8 +317,11 @@ language sql stable security definer set search_path = public as $$
    limit 50;
 $$;
 
-revoke all on function public.touch_me(text), public.record_answer(boolean, text), public.bump_set_stat(text, text), public.get_leaderboard(text) from public, anon;
-grant execute on function public.touch_me(text), public.record_answer(boolean, text), public.bump_set_stat(text, text), public.get_leaderboard(text) to authenticated;
+revoke all on function public.touch_me(text), public.record_answer(boolean, text), public.record_batch(boolean, jsonb, text[], text, jsonb), public.my_stats(), public.bump_set_stat(text, text), public.get_leaderboard(text) from public, anon;
+grant execute on function public.touch_me(text), public.record_answer(boolean, text), public.record_batch(boolean, jsonb, text[], text, jsonb), public.my_stats(), public.bump_set_stat(text, text), public.get_leaderboard(text) to authenticated;
+-- bootstrap is also for visitors who are not signed in (it returns only the public content versions for them)
+revoke all on function public.bootstrap() from public;
+grant execute on function public.bootstrap() to anon, authenticated;
 revoke all on function public.handle_new_user() from public, anon, authenticated;
 
 create or replace function public.admin_reset_user(p_id uuid) returns void
@@ -331,6 +440,7 @@ alter table public.content enable row level security;
 alter table public.user_daily_stats enable row level security;
 alter table public.user_subject_stats enable row level security;
 alter table public.set_stats enable row level security;
+alter table public.question_stats enable row level security;
 alter table public.reports enable row level security;
 alter table public.anti_cheat_logs enable row level security;
 alter table public.audit_logs enable row level security;
@@ -352,9 +462,11 @@ create policy "content admin write" on public.content for all to authenticated u
 drop policy if exists "daily own or admin" on public.user_daily_stats;
 drop policy if exists "subject own or admin" on public.user_subject_stats;
 drop policy if exists "set stats admin" on public.set_stats;
+drop policy if exists "question stats admin" on public.question_stats;
 create policy "daily own or admin" on public.user_daily_stats for select to authenticated using (user_id = auth.uid() or public.is_admin());
 create policy "subject own or admin" on public.user_subject_stats for select to authenticated using (user_id = auth.uid() or public.is_admin());
 create policy "set stats admin" on public.set_stats for select to authenticated using (public.is_admin());
+create policy "question stats admin" on public.question_stats for select to authenticated using (public.is_admin());
 
 drop policy if exists "reports students send" on public.reports;
 drop policy if exists "reports admin all" on public.reports;

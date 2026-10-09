@@ -69,6 +69,8 @@ export async function signInWithGoogle(redirectTo?: string) {
  * Sign out current session
  */
 export async function signOut() {
+  userCache = null;
+  bootCache = null;
   const client = getSupabase();
   if (typeof window !== 'undefined') {
     localStorage.removeItem('sj_demo_auth');
@@ -89,7 +91,7 @@ export async function signOut() {
 /**
  * Get current session user
  */
-export async function getCurrentUser() {
+async function fetchCurrentUser() {
   const client = getSupabase();
   if (!client) {
     if (process.env.NODE_ENV !== 'production' && typeof window !== 'undefined') {
@@ -106,16 +108,11 @@ export async function getCurrentUser() {
   }
 
   try {
+    // The session is read from this browser (no network). Visitors who are not signed in cost nothing.
     const { data: { session }, error: sessionError } = await client.auth.getSession();
     if (sessionError || !session?.user) return null;
-
-    // Fetch profile for role and ban status with maybeSingle to avoid 406/error if profile not yet created
-    const { data: profile } = await client
-      .from('profiles')
-      .select('*')
-      .eq('id', session.user.id)
-      .maybeSingle();
-
+    const boot = await getBootstrap(); // role and ban status come from the one shared bootstrap request
+    const profile = boot?.profile;
     return {
       id: session.user.id,
       email: session.user.email,
@@ -128,6 +125,50 @@ export async function getCurrentUser() {
     console.error('Error fetching Supabase session/user:', err);
     return null;
   }
+}
+
+// ONE request that tells the app who is signed in (role, ban status), whether the admin password step is done,
+// and which shared content changed. Kept for 60 seconds and shared by everything on the page.
+export type Boot = {
+  profile: { id: string; email: string; name: string; avatar_url: string | null; role: string; status: string } | null;
+  unlocked: boolean;
+  versions: { key: string; updated_at: string }[];
+};
+let bootCache: { at: number; value: Boot | null } | null = null;
+let bootInflight: Promise<Boot | null> | null = null;
+export async function getBootstrap(fresh = false): Promise<Boot | null> {
+  const client = getSupabase();
+  if (!client) return null;
+  if (!fresh && bootCache && Date.now() - bootCache.at < 60000) return bootCache.value;
+  if (!bootInflight || fresh) {
+    bootInflight = (async () => {
+      const r = await client.rpc('bootstrap');
+      const value = r.error ? null : (r.data as Boot);
+      bootCache = { at: Date.now(), value };
+      return value;
+    })().finally(() => {
+      bootInflight = null;
+    });
+  }
+  return bootInflight;
+}
+
+// Every page and component asks "who is signed in?". One shared answer, kept for 60 seconds, saves a database request each time.
+let userCache: { at: number; value: Awaited<ReturnType<typeof fetchCurrentUser>> } | null = null;
+let userInflight: Promise<Awaited<ReturnType<typeof fetchCurrentUser>>> | null = null;
+export async function getCurrentUser(fresh = false) {
+  if (!fresh && userCache && Date.now() - userCache.at < 60000) return userCache.value;
+  if (!userInflight || fresh) {
+    userInflight = fetchCurrentUser()
+      .then((value) => {
+        userCache = { at: Date.now(), value };
+        return value;
+      })
+      .finally(() => {
+        userInflight = null;
+      });
+  }
+  return userInflight;
 }
 
 /**
